@@ -1,0 +1,17 @@
+schema_version = "1.1.0"
+
+id = "phantom_dust_stage"
+version = "1.2.0"
+name = "Phantom Dust Stage"
+tagline = "Build Phantom Dust arenas and export them to the game"
+maintainer = "Nuion (Eradication0)"
+type = "add-on"
+website = "https://github.com/eradication0/Phantom-Dust-Content-Creation-Tool"
+tags = ["Import-Export", "Game Engine"]
+
+blender_version_min = "5.3.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read arena files, write maps and install them into the game"

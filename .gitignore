@@ -1,0 +1,28 @@
+# Never commit game files or anything extracted from them
+*.alr
+*.dat
+*.cad
+*.cam
+*.ala
+*.ak
+*.mk
+*.ssb
+*.stx
+*.xwb
+*.xsb
+*.cso
+*.exe
+*.dll
+
+# Tool output
+*.obj
+*.mtl
+*.png
+!docs/**/*.png
+out/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
