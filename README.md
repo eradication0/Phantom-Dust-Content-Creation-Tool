@@ -17,9 +17,33 @@ files (`stNN.dat` and `stNN.alr`) and can install them for you.
 | Game lighting for the stage and characters (sun direction and colours) | Works in game |
 | Fog | Not possible: the PC version ignores fog |
 | Materials: highlight colour and shininess, shine mask, normal maps, reflection maps | New in 1.1, in-game test pending |
-| Shadows cast by the stage itself | Not yet |
+| Transparent materials (checkbox and slider) | New in 1.3 |
+| Scrolling textures (water, lava, glow; speeds per layer) | New in 1.3, works in game |
+| Stage shadow casters (import, Stretch/Fix Shadow Casters) | New in 1.3 |
+| Scale guides: the player model on spawns, the aura capsule on orbs (viewport only) | New in 1.3 |
+| Characters: load, animate, export over a battle character | Works in game |
+| Characters: texture export / extract / import, readable bone names, shine paint, extended Check | New in 1.3 |
 
-Character models and skill animations/projectiles are planned after maps.
+Skill animations/projectiles are planned later.
+
+## What's new in 1.3
+
+- **Transparent** checkbox and **Transparency** slider on the Phantom Dust material (the game's see-through
+  shaders; survives import and export of the game's own maps).
+- **Scrolling Textures** on the Phantom Dust material: colour, normal map A and normal map B each with an X / Y
+  speed; Solid, See-through or Glow. Uses the sky's cloud shader, lit by the map's light.
+- The 20 MiB model data limit is checked on export, and unused textures and vertex data of the replaced map are
+  stripped.
+- Light baking: point lights in the Lighting collection, over-bright light in the light map's alpha, a more
+  faithful preview; fixed a crash at the end of a bake.
+- Shadow casters: imported with maps, **Stretch/Fix Shadow Casters** stretches them away from the sun.
+- Breakable objects: break and debris sounds to pick per collection.
+- Hide / Show Broken Parts button; colliders drawn as light-green wireframes.
+- Scale guides: Edgar T-posing on every spawn and the aura capsule on every orb (never exported).
+- Characters: **Export Textures of Selected**, **Extract All** / **Import** textures (converted to the game's
+  format), cut-out and shine alpha shown correctly, the lighting lookup and the shine mask kept on export,
+  **Readable Bones** (game names kept and exported), **Shine Paint** vertex paint layer, and a **Check** that
+  covers textures, bones, weights, UVs and materials.
 
 You need your own copy of the game. This repository contains no game files.
 

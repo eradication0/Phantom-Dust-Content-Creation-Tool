@@ -225,6 +225,9 @@ def import_objects(context, b_dat, b_alr, parent, scale, stage, variant=0):
             if any(anims):                                # moving objects (containers, iron roads): kept as is
                 first['pd_object_anims'] = [x.hex() if x else '' for x in anims]
                 report_parts['animations'] += 1
+            snd_off = struct.unpack_from('<I', b_dat, 0xF8)[0]
+            if snd_off != 0xFFFFFFFF and snd_off + (oid + 1) * 16 <= len(b_dat):
+                first['pd_object_sounds'] = list(struct.unpack_from('<8H', b_dat, snd_off + oid * 16))
             fx = [_effect_block(b_dat, entry[9 + k]) for k in range(3)]
             if any(fx):
                 first['pd_object_effects'] = [x.hex() if x else '' for x in fx]

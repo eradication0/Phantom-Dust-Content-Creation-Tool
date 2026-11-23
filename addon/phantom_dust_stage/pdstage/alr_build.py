@@ -72,18 +72,52 @@ def lbts_record(index, diffuse, lightmap, normal, specular=(0, 0, 0, 0)):
     return bytes(raw)
 
 
-def material_record(kind, index, diffuse, normal=None, reflection=None, specular=(0, 0, 0, 0)):
+# Scrolling surfaces: the sky's cloud shader sbtscloud3 (st01's cloud material as the template), the only lit stage
+# shader whose UVs move. Vertex format 0x03 (as sbts: position, normal, UV, colour, tangent, binormal). Slots: 0 the
+# colour texture, 1 and 2 two normal maps (each on its own scroll, added together for the bumps); colour =
+# texture x (sun + point light + ambient on those bumps). Alpha = the colour texture's alpha "overlaid" with the two
+# normal maps' alphas, x vertex alpha (cut out at misc_constant). +0x3C: three (x, y) s16 speeds, colour / normal A /
+# normal B (the sky: 150 = slow drift; 0 = still).
+SCROLL_TEMPLATE = ('5e43f3b200355f9d000000003d04000003100200001421040f0010001000000000000000000000000000000000000000'
+                   '000000ff7f7f7f140000000078001e00c80000002c01140000000000')
+SCROLL_BLEND = {'OPAQUE': (0x00, 0x11), 'ALPHA': (0x10, 0x54), 'ADD': (0x10, 0x14)}   # +0x0C flag, +0x15 factors
+
+
+def scroll_record(index, diffuse, normal_a, normal_b, speeds=(0, 0, 0, 0, 0, 0), blend='OPAQUE'):
+    """A scrolling material entry (shader sbtscloud3). speeds: (x, y) for the colour texture, normal map A and
+    normal map B. blend: 'OPAQUE', 'ALPHA' (see-through by alpha) or 'ADD' (glow added on top, as the clouds)."""
+    raw = bytearray(bytes.fromhex(SCROLL_TEMPLATE))
+    flag, factors = SCROLL_BLEND.get(blend, SCROLL_BLEND['OPAQUE'])
+    raw[0x0C] = 0x2D | flag
+    raw[0x15] = factors
+    raw[0x12] = index & 0xFF
+    struct.pack_into('<4H', raw, 0x18, diffuse, normal_a, normal_b, diffuse)
+    struct.pack_into('<6h', raw, 0x3C, *(int(max(-32768, min(32767, round(v)))) for v in speeds))
+    return bytes(raw)
+
+
+def material_record(kind, index, diffuse, normal=None, reflection=None, specular=(0, 0, 0, 0), transparent=False):
     """One 0x4C-byte material entry for a stage shader.
 
     kind: 'sd', 'sbts', 'sdrefs' or 'sbtsrefs'. diffuse/normal/reflection: absolute texture-table indices.
     specular: (r, g, b, power) bytes; the game adds colour * (N.H)^power on top of the lit texture (shine
-    mask = vertex alpha). Colour (0, 0, 0) = no highlight, as on most of the game's own surfaces."""
+    mask = vertex alpha). Colour (0, 0, 0) = no highlight, as on most of the game's own surfaces.
+    transparent: the blended variant of the shader (sdal, sbtsal, sdrefsal, sbtsrefsal: drawn see-through by the
+    diffuse texture's alpha) and flag 0x10 at +0x0C, as on the game's own glass (st07 sdal, st03 sbpxrefsal)."""
     raw = bytearray(bytes.fromhex(MATERIAL_TEMPLATES[kind]))
+    if transparent:
+        struct.pack_into('<2I', raw, 0, *encode_text(kind + 'al'))
     r, g, b, power = (int(max(0, min(255, round(x)))) for x in specular)
     spec_on = (r or g or b) and power > 0
     bump = kind in ('sbts', 'sbtsrefs')
-    raw[0x0C] = (0x29 if bump else 0x09) | (0x04 if spec_on else 0)
+    raw[0x0C] = (0x29 if bump else 0x09) | (0x04 if spec_on else 0) | (0x10 if transparent else 0)
     raw[0x0D] = 0x04 if kind.endswith('refs') else 0x00
+    if transparent:
+        # +0x15: blend factors, a nibble each (source low, destination high; 1 one, 4 source alpha, 5 inverse
+        # source alpha). Solid templates have 0x11 (one/one: additive once blending is on, which drew every
+        # transparent mesh as faint glass whatever its alpha); the game's glass (st07 sdal, st05/st03
+        # sbpxrefsal) uses 0x54: normal alpha blending.
+        raw[0x15] = 0x54
     raw[0x10] = BUMP_FORMAT if bump else FORMAT
     raw[0x11] = 0x10
     raw[0x12] = index & 0xFF
@@ -168,16 +202,20 @@ def _templates(b):
     if prim5_unk is not None:
         found['mesh'][0x30:0x40] = prim5_unk          # fields that go with triangle-list meshes
     # The stage's shadow mesh (shader sshadowch, vertex format 0x07): without it characters cast no shadow.
-    found['shadow'] = None
+    # Most maps have sshadowc instead (vertex format 0x10, position only): volumes already stretched along the
+    # map's sun when it was made; the shadow casters are written that way there (shadow_meshes).
+    found['shadow'] = found['shadow_c'] = None
     for r in h['roots']:
         mats = None
         for off, t, size in alr.chain(b, r):
             if t == 0x01:
                 mats = alr._materials(b, off)
-            elif t == 0x02 and mats and found['shadow'] is None:
+            elif t == 0x02 and mats:
                 mat_i = struct.unpack_from('<H', b, off + 0x40)[0]
-                if mat_i < len(mats) and mats[mat_i]['shader'] == 'sshadowch':
-                    found['shadow'] = dict(material=bytes(mats[mat_i]['raw']), header=bytes(b[off:off + 0x68]))
+                shader = mats[mat_i]['shader'] if mat_i < len(mats) else ''
+                key = {'sshadowch': 'shadow', 'sshadowc': 'shadow_c'}.get(shader)
+                if key and found[key] is None:
+                    found[key] = dict(material=bytes(mats[mat_i]['raw']), header=bytes(b[off:off + 0x68]))
     tex = [t for t in alr.textures(b)]
     t86 = next((t for t in tex if t['raw_format'] == TEX_FORMAT), None)
     hoff = h['header_size']
@@ -249,14 +287,65 @@ def _box(centre, size):
     return verts, tris
 
 
+def shadow_fins(verts, tris):
+    """The zero-area strips a shadow volume needs on every edge between faces of different normals (the game
+    stretches them into the volume's sides): for face A's edge a->b and face B's matching edge b->a, the two
+    triangles (bA, aA, aB) and (bA, aB, bB). verts: [(position, normal)]; returns the new triangles."""
+    edges, fins = {}, []
+    for t in tris:
+        for a, c in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            pa, pc = verts[a][0], verts[c][0]
+            other = edges.get((pc, pa))
+            if other:
+                c2, a2 = other.pop()                     # the other face's c -> a
+                if (a, c) != (a2, c2):
+                    fins += [(c, a, a2), (c, a2, c2)]
+            else:
+                edges.setdefault((pa, pc), []).append((a, c))
+    return fins
+
+
+SHADOW_C_FORMAT, SHADOW_C_VERTEX_SIZE = 0x10, 0x0C
+
+
+def _shadow_volume_c(tpl, meshes):
+    """Meshes written as they are as sshadowc volumes (position only: already stretched along the sun)."""
+    pv, pt, pidx = [], [], {}
+    for m in meshes:
+        if 'raw' in m:
+            continue
+        for t in m['tris']:
+            f = []
+            for i in t:
+                k = tuple(round(c, 3) for c in m['verts'][i][0])
+                if k not in pidx:
+                    pidx[k] = len(pv)
+                    pv.append((k, 0))
+                f.append(pidx[k])
+            if len(set(f)) == 3:
+                pt.append(tuple(f))
+    if not pt:
+        return []
+    return [dict(raw=dict(material=tpl['shadow_c']['material'], format=SHADOW_C_FORMAT,
+                          vertex_size=SHADOW_C_VERTEX_SIZE,
+                          vertex_bytes=b''.join(struct.pack('<3f', *p) for p, _ in part_verts),
+                          tris=part_tris, header=tpl['shadow_c']['header']))
+            for part_verts, part_tris in split_mesh(pv, pt)]
+
+
 def shadow_meshes(tpl, meshes, mode='minimal'):
-    """Shadow mesh for a stage, using the game original's sshadowch material (vertex format 0x07).
+    """Shadow mesh for a stage, from the game original's shadow materials.
 
     The game needs one for characters to cast shadows. In the original maps it holds shadow volumes of the
     stage (closed shapes the game darkens what falls inside), so a plain copy of the stage looks wrong.
-    mode 'minimal': a 1-unit closed box far below the stage: turns character shadows on, adds no stage shadows.
-    mode 'full': every triangle of the meshes (for experiments; draws badly in game).
-    Returns raw mesh dicts for build_model (empty if the game original has no shadow mesh)."""
+    mode 'minimal': a 1-unit closed box far below the stage (sshadowch): turns character shadows on, adds no
+    stage shadows.
+    mode 'full': the meshes are finished shadow volumes (the ShadowCasters collection, stretched along the sun by
+    the add-on's Stretch button): written as they are as sshadowc (position only), or, if the game original has no
+    sshadowc, as sshadowch with the zero-area strips on every edge (the game then stretches it a little more).
+    Returns raw mesh dicts for build_model (empty if the game original has no shadow material)."""
+    if mode == 'full' and tpl.get('shadow_c'):
+        return _shadow_volume_c(tpl, meshes)
     if not tpl.get('shadow'):
         return []
     index, verts, tris = {}, [], []
@@ -282,7 +371,11 @@ def shadow_meshes(tpl, meshes, mode='minimal'):
                     index[key] = len(verts)
                     verts.append(key)
                 out.append(index[key])
-            tris.append(tuple(out))
+            if len(set(verts[k][0] for k in out)) == 3:
+                tris.append(tuple(out))
+    if not tris:
+        return []
+    tris += shadow_fins(verts, tris)
     result = []
     for part_verts, part_tris in split_mesh(verts, tris):
         data = b''.join(struct.pack('<3fI', *p, n) for p, n in part_verts)
@@ -379,19 +472,34 @@ def build_model(tpl, meshes, texture_base_index, rb_base, nodes=None, material_u
             for verts, tris in split_mesh(m['verts'], m['tris']):
                 parts.append((mat_index[key], verts, tris, m.get('node', 0), 'lm'))
             continue
+        if 'material' in m and m['material'].get('scroll') is not None:     # scrolling (sbtscloud3)
+            md = m['material']
+            sc = md['scroll']
+            d, na, nb = absolute(md['diffuse']), absolute(sc['normal_a']), absolute(sc['normal_b'])
+            key = ('scroll', d, na, nb, tuple(sc['speeds']), sc.get('blend', 'OPAQUE'))
+            if key not in mat_index:
+                mat_index[key] = len(materials)
+                materials.append(scroll_record(len(materials), d, na, nb, sc['speeds'], sc.get('blend', 'OPAQUE')))
+            if any(len(v) < 6 for v in m['verts']):
+                raise ValueError('a scrolling mesh needs a tangent and binormal on every vertex')
+            for verts, tris in split_mesh(m['verts'], m['tris']):
+                parts.append((mat_index[key], verts, tris, m.get('node', 0), True))
+            continue
         if 'material' in m:
             md = m['material']
             d, n, rf = absolute(md['diffuse']), absolute(md.get('normal')), absolute(md.get('reflection'))
             spec = tuple(md.get('specular', (0, 0, 0, 0)))
+            see = bool(md.get('transparent'))
         else:
             d = m['texture_index'] if 'texture_index' in m else texture_base_index + m['texture']
             n = rf = None
             spec = (0, 0, 0, 0)
+            see = False
         kind = shader_for(n is not None, rf is not None)
-        key = (kind, d, n, rf, spec)
+        key = (kind, d, n, rf, spec, see)
         if key not in mat_index:
             mat_index[key] = len(materials)
-            materials.append(material_record(kind, len(materials), d, n, rf, spec))
+            materials.append(material_record(kind, len(materials), d, n, rf, spec, see))
         bump = n is not None
         if bump and any(len(v) < 6 for v in m['verts']):
             raise ValueError('a normal-mapped mesh needs a tangent and binormal on every vertex')
@@ -500,7 +608,8 @@ def raw_mesh(b, mesh, rb_off, apply_node=True):
 
 # ---------------------------------------------------------------- the whole file
 
-def rebuild(b, replace=None, textures=(), clear=(), shadows_for=(), shadow_mode='minimal', add_models=()):
+def rebuild(b, replace=None, textures=(), clear=(), shadows_for=(), shadow_mode='minimal', add_models=(),
+            shadow_source=None):
     """New .alr bytes.
 
     replace:     {root index: list of meshes} (see build_model); texture indices refer to `textures`.
@@ -541,8 +650,11 @@ def rebuild(b, replace=None, textures=(), clear=(), shadows_for=(), shadow_mode=
             model = replace[i]
             ms, nodes, unk = (list(model['meshes']), model.get('nodes'), model.get('material_unk')) \
                 if isinstance(model, dict) else (list(model), None, None)
-            if i in shadows_for:
-                ms += shadow_meshes(tpl, ms, shadow_mode)
+            if i in shadows_for:                     # shadow_source: the ShadowCasters meshes, as they are
+                if shadow_source:
+                    ms += shadow_meshes(tpl, shadow_source, 'full')
+                else:
+                    ms += shadow_meshes(tpl, ms, shadow_mode)
             chain, vdata, st = build_model(tpl, ms, t15[2], len(rb), nodes, unk)
             rb += vdata
             stats[i] = st
@@ -584,3 +696,102 @@ def rebuild(b, replace=None, textures=(), clear=(), shadows_for=(), shadow_mode=
     struct.pack_into('<I', meta, 0x14, len(rb))
     struct.pack_into('<%dI' % len(roots), meta, 0x20, *roots)
     return bytes(meta) + bytes(rb), stats
+
+
+# ---------------------------------------------------------------- dropping unused data
+
+def _texture_bytes(t):
+    """Bytes of a texture's mip chain, or None when unsure (cube maps, unknown formats)."""
+    if t['cubemap']:
+        return None
+    f, w, h, total = t['format'], t['width'], t['height'], 0
+    bpp = {0x00: 1, 0x02: 2, 0x04: 2, 0x05: 2, 0x06: 4, 0x12: 4, 0x13: 1, 0x1F: 1, 0x28: 4}
+    if f not in bpp and f not in (0x0C, 0x0E, 0x0F):
+        return None
+    for _ in range(max(1, t['mips'])):
+        total += (max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * (8 if f == 0x0C else 16)) if f in (0x0C, 0x0E, 0x0F) \
+            else w * h * bpp[f]
+        w, h = max(1, w // 2), max(1, h // 2)
+    return total
+
+
+def strip_unused(b):
+    """Drop resource-buffer data nothing in the file uses: vertex data of replaced models (the game original's own
+    stage, or an earlier export's) and textures no material uses that come after the game's effect textures
+    (e3..., envmap: the .dat's effects use those by number, so they and everything before them stay).
+    Dropped textures keep their table entry (texture numbers stay the same) and point at one 4 x 4 texture.
+    The resource buffer is packed again (each piece keeps its alignment within 256 bytes) and the offsets
+    in the texture table and vertex-buffer entries are moved. Returns (bytes, dict(textures, saved))."""
+    h = alr.header(b)
+    hsize, ro, rs = h['header_size'], h['resource_offset'], h['resource_size']
+    n_tex = struct.unpack_from('<I', b, hsize + 8)[0]
+    texs = alr.textures(b)
+    mats, vbs = set(), set()
+    for r in h['roots']:
+        for off, tp, _sz in alr.chain(b, r):
+            if tp == 0x01:
+                mats.update(off + 0xC + i * 0x4C for i in range(struct.unpack_from('<H', b, off + 8)[0]))
+            elif tp == 0x16:
+                vbs.update(off + 0xC + i * 0x1C for i in range(struct.unpack_from('<I', b, off + 8)[0]))
+    used = set()
+    for e in mats:
+        used.update(t for t in struct.unpack_from('<4H', b, e + 0x18) if t != 0xFFFF)
+    last_fx = max([t['index'] for t in texs if t['name'].startswith(('e3', 'envmap'))] or [-1])
+    drop = {t['index'] for t in texs if t['index'] > last_fx and t['index'] not in used}
+
+    starts = sorted({t['offset'] for t in texs} | {struct.unpack_from('<I', b, e + 0x14)[0] for e in vbs} | {rs})
+
+    def next_start(a):
+        return next(s for s in starts if s > a) if a < rs else rs
+
+    live = []
+    for t in texs:
+        if t['index'] in drop:
+            continue
+        n = _texture_bytes(t)
+        end = next_start(t['offset']) if n is None else min(rs, t['offset'] + n)
+        live.append((t['offset'], max(end, t['offset'])))
+    for e in vbs:
+        fmt, vsize, vsize2 = struct.unpack_from('<3B', b, e)
+        count, off = struct.unpack_from('<I', b, e + 8)[0], struct.unpack_from('<I', b, e + 0x14)[0]
+        live.append((off, min(rs, off + count * max(vsize, vsize2, 1))))
+    live.sort()
+    merged = []
+    for s, e in live:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    rb = bytearray()
+    moved = []                                                   # (old start, old end, new start)
+    for s, e in merged:
+        new = len(rb) + (-(len(rb) - s) % 0x100)                 # same position within 256 bytes as before
+        rb += b'\0' * (new - len(rb))
+        rb += b[ro + s:ro + e]
+        moved.append((s, e, new))
+    dummy = None
+    if drop:
+        rb += b'\0' * (-len(rb) % 0x100)
+        dummy = len(rb)
+        rb += bytes(8)                                           # 4 x 4 DXT1, black
+    rb += b'\0' * (-len(rb) % 0x10)
+
+    def where(a):
+        for s, e, new in moved:
+            if s <= a < e or (a == s):
+                return new + (a - s)
+        raise ValueError('offset %#x is not kept' % a)
+
+    meta = bytearray(b[:ro])
+    for t in texs:
+        e = hsize + 0xC + t['index'] * 0x1C
+        if t['index'] in drop:
+            struct.pack_into('<I', meta, e + 4, dummy)
+            struct.pack_into('<4B', meta, 0x0C + e, meta[e + 0x0C], 0x0C, (2 << 4) | 1, 2)
+            struct.pack_into('<I', meta, e + 0x10, 0)
+        else:
+            struct.pack_into('<I', meta, e + 4, where(t['offset']))
+    for e in vbs:
+        struct.pack_into('<I', meta, e + 0x14, where(struct.unpack_from('<I', b, e + 0x14)[0]))
+    struct.pack_into('<I', meta, 0x14, len(rb))
+    return bytes(meta) + bytes(rb), dict(textures=len(drop), saved=rs - len(rb))

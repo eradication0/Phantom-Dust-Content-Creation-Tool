@@ -254,6 +254,7 @@ def gather_collision(context, scale):
     return tris
 
 
+RESOURCE_LIMIT = 20 * 1024 * 1024   # the game loads a model file's vertex + texture data into 20 MiB (see export_models)
 COLLISION_GUIDE = 10000  # collision triangles: the game's maps use 2,700-9,300; a 52k one crashed on load
 CARRIED_MODELS = {}      # (home map, MD00 slot) -> (new .alr root, model name), from the last export_models
 
@@ -279,6 +280,14 @@ def export_models(context, game_original_alr, out_alr_path, scale, background_an
     base = open(game_original_alr, 'rb').read()
     textures = vx.Textures(vx.alr.textures(base), compress=compress_textures)
     report = []
+    leftovers = [t['name'] for t in vx.alr.textures(base) if t['name'].startswith(('pd_', 'pdlm'))]
+    if leftovers:
+        # the "game original" is an earlier export (copied into the game by hand before the add-on made its
+        # backup): its added textures and models are carried along unused and take memory in game
+        report.append('WARNING: the game original %s already holds an earlier export (%d of its textures, e.g. %s): '
+                      'its unused parts are left out, but put the game\'s own %s back (verify the game files)'
+                      % (os.path.basename(game_original_alr), len(leftovers), leftovers[0],
+                         os.path.basename(game_original_alr)))
     try:
         replace, vstats = vx.gather(context, vis_cols, scale, textures) if vis_cols else ({}, dict(clamped_uv=0))
         types, ostats = ox.gather(context, obj_cols, scale, textures) if obj_cols else ([], dict(clamped_uv=0))
@@ -315,9 +324,64 @@ def export_models(context, game_original_alr, out_alr_path, scale, background_an
         report.append('%d biggest textures compressed to fit %d MB' % (squeezed, texture_budget_mb))
     if halved:
         report.append('textures made smaller %d times to fit %d MB' % (halved, texture_budget_mb))
-    data, built = vx.alr_build.rebuild(base, replace=replace, textures=textures.new,
-                                       add_models=add_models + fx_models,
-                                       shadows_for=(0,) if shadows and 0 in replace else ())
+    stripped = {}
+    from . import realtime
+    casters = realtime.shadow_meshes(context, scale) if shadows and 0 in replace else []
+    shadow_source = casters or None
+    if casters:
+        report.append('shadow casters: %d meshes, %d triangles' % (len(casters), sum(len(m['tris']) for m in casters)))
+        flat = [m['name'] for m in casters if not m['stretched']]
+        if flat:
+            report.append('WARNING: shadow casters not stretched yet (press Stretch/Fix Shadow Casters): %s'
+                          % ', '.join(flat))
+
+    def build():
+        # then drop what nothing uses (the replaced models' old vertex data, an earlier export's leftover
+        # textures), so it doesn't count toward the game's 20 MiB
+        data, built = vx.alr_build.rebuild(base, replace=replace, textures=textures.new,
+                                           add_models=add_models + fx_models,
+                                           shadows_for=(0,) if shadows and 0 in replace else (),
+                                           shadow_source=shadow_source)
+        data, st = vx.alr_build.strip_unused(data)
+        stripped.update(st)
+        return data, built
+
+    data, built = build()
+    # The game loads a model file's data (vertices + textures) into 20 MiB: anything past it shows as rainbow
+    # textures or exploding geometry (tested: 15.5 MiB fine; 21.1, 21.3, 25.2, 29.0 MiB broken). Shrink the
+    # biggest new textures (light maps included) until it fits.
+    size = lambda t: sum(len(l) for l in t['levels'])
+    fitted = 0
+    while vx.alr.header(data)['resource_size'] > RESOURCE_LIMIT:
+        excess = vx.alr.header(data)['resource_size'] - RESOURCE_LIMIT
+        saved = 0
+        while saved < excess:
+            cands = [t for t in textures.new if len(t['levels']) > 1 and min(t['width'], t['height']) > 16]
+            if not cands:
+                break
+            t = max(cands, key=size)
+            before = size(t)
+            t['levels'] = t['levels'][1:]
+            t['width'], t['height'] = max(1, t['width'] // 2), max(1, t['height'] // 2)
+            if 'mips' in t:
+                t['mips'] = len(t['levels'])
+            saved += before - size(t)
+            fitted += 1
+        if not saved:
+            raise ExportError('the map\'s model data is %.1f MiB even with the smallest textures; the game only '
+                              'loads %.0f MiB (more shows as broken geometry and textures): use fewer triangles%s'
+                              % (vx.alr.header(data)['resource_size'] / 1048576.0, RESOURCE_LIMIT / 1048576.0,
+                                 ', and put the game\'s own %s back (it holds an earlier export)'
+                                 % os.path.basename(game_original_alr) if leftovers else ''))
+        data, built = build()
+    if fitted:
+        report.append('textures made smaller %d times so the model data fits the game\'s %d MiB'
+                      % (fitted, RESOURCE_LIMIT // 1048576))
+    if stripped.get('saved', 0) > 65536:
+        report.append('%.1f MiB of unused data left out%s' % (stripped['saved'] / 1048576.0,
+                      ' (%d unused textures)' % stripped['textures'] if stripped['textures'] else ''))
+    report.append('model data %.1f of %d MiB' % (vx.alr.header(data)['resource_size'] / 1048576.0,
+                                                 RESOURCE_LIMIT // 1048576))
     with open(out_alr_path, 'wb') as f:
         f.write(data)
     def meshes_of(model):                                    # a list of meshes, or dict(meshes, nodes, ...)

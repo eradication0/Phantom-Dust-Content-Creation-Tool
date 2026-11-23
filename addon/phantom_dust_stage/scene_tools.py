@@ -106,6 +106,7 @@ class PDSTAGE_OT_new_map(bpy.types.Operator):
         _collection(scene, 'Sky', vis)
         _collection(scene, 'Background', vis)
         cols = _collection(scene, 'Colliders', role='COLLIDERS')          # surface: the replaced map's standard
+        _collection(scene, 'ShadowCasters', role='SHADOWS')               # closed meshes: real-time shadows
         sp = _collection(scene, 'Spawn_Points', role='SPAWNS')
         lay = _collection(scene, 'LAYOUT_1', sp)
         objs = _collection(scene, 'Objects', role='OBJECTS')
@@ -235,6 +236,8 @@ SPAWN_ITEMS = [
     ('RESTRICTED', 'Restriction Wall', 'An invisible wall that keeps players in (Colliders, surface 10)'),
     ('BREAKABLE', 'Breakable Box', 'A box that breaks into 8 pieces, with its collider (Objects)'),
     ('STEAM', 'Steam Pipe', 'A steam pipe effect (Effects > Steam Pipe)'),
+    ('SHADOW_BOX', 'Shadow Caster', 'A quad that casts real-time character shadows in game (ShadowCasters): '
+                                   'press Stretch/Fix Shadow Casters to stretch it along the Sun'),
 ]
 
 
@@ -303,6 +306,15 @@ class PDSTAGE_OT_spawn_example(bpy.types.Operator):
                         p.hide_render = True
                         tc.objects.link(p)
                         p.hide_set(True)          # pieces sit inside the box: shown with the eye icon
+        elif self.kind == 'SHADOW_BOX':
+            casters = _role_collection(scene, 'SHADOWS', 'ShadowCasters')
+            me = bpy.data.meshes.new('ShadowCaster')          # one quad facing up: Stretch makes the volume
+            me.from_pydata([(-1, -1, 0), (1, -1, 0), (1, 1, 0), (-1, 1, 0)], [], [(0, 1, 2, 3)])
+            me.update()
+            ob = bpy.data.objects.new('ShadowCaster', me)
+            ob.location = at
+            ob.hide_render = True                        # real-time only: kept out of the lighting bake
+            casters.objects.link(ob)
         elif self.kind == 'STEAM':
             fx = _role_collection(scene, 'EFFECTS', 'Effects')
             steam = next((c for c in fx.children if c.pd_effect == 'STEAM_PIPE'), None)
@@ -317,6 +329,113 @@ class PDSTAGE_OT_spawn_example(bpy.types.Operator):
         ob.select_set(True)
         context.view_layer.objects.active = ob
         self.report({'INFO'}, 'Added %s at the 3D cursor' % dict((k, n) for k, n, _d in SPAWN_ITEMS)[self.kind])
+        return {'FINISHED'}
+
+
+# Broken-state parts of breakable objects (pieces and the broken collision) sit inside the whole object: they
+# are hidden while modelling, and always before an export. Collision meshes (collider_ parts and everything in
+# a Colliders collection) draw as light green see-through wireframes.
+HIDE_PREFIXES = ('break_', 'collider_broken_', 'stay_')
+COLLIDER_PREFIX = 'collider_'
+COLLIDER_COLOUR = (0.45, 1.0, 0.45, 1.0)     # light green
+
+
+def broken_parts(scene):
+    return [o for o in scene.objects if o.name.startswith(HIDE_PREFIXES)]
+
+
+def _hidden(o):
+    try:
+        return o.hide_get()
+    except RuntimeError:                  # not in the view layer
+        return True
+
+
+def set_broken_parts_hidden(context, hide):
+    """Hide (or show) every break_ / collider_broken_ / stay_ object. Returns how many changed."""
+    n = 0
+    for o in broken_parts(context.scene):
+        if _hidden(o) != hide:
+            try:
+                o.hide_set(hide)
+                n += 1
+            except RuntimeError:
+                pass
+    return n
+
+
+def collider_display_objects(scene):
+    """Mesh objects drawn as collision wireframes: named collider_..., or anywhere under a Colliders collection."""
+    out = {o.name: o for o in scene.objects if o.type == 'MESH' and o.name.startswith(COLLIDER_PREFIX)}
+    for c in exporter.collections_with_role(scene, 'COLLIDERS'):
+        for o in c.all_objects:
+            if o.type == 'MESH':
+                out[o.name] = o
+    return list(out.values())
+
+
+SHADOW_COLOUR = (0.65, 0.35, 1.0, 1.0)      # purple: shadow casters
+
+
+def style_colliders(scene):
+    """Collision meshes drawn as light green wireframes (see-through); the 3D views colour wires by object for it.
+    Only touches what differs, so it is cheap to run after every change."""
+    changed = False
+    shadows = [o for c in exporter.collections_with_role(scene, 'SHADOWS') for o in c.all_objects if o.type == 'MESH']
+    for objs, colour in ((collider_display_objects(scene), COLLIDER_COLOUR), (shadows, SHADOW_COLOUR)):
+        for o in objs:
+            if o.display_type != 'WIRE':
+                o.display_type = 'WIRE'
+                changed = True
+            if any(abs(a - b) > 1e-3 for a, b in zip(o.color, colour)):
+                o.color = colour
+                changed = True
+    if changed:
+        for screen in bpy.data.screens:
+            for area in screen.areas:
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D' and space.shading.wireframe_color_type != 'OBJECT':
+                        space.shading.wireframe_color_type = 'OBJECT'
+    return changed
+
+
+@bpy.app.handlers.persistent
+def _style_colliders_handler(*_args):
+    try:
+        scene = bpy.context.scene
+        if scene is not None:
+            style_colliders(scene)
+    except Exception:                     # a viewport convenience: never break anything
+        pass
+
+
+def register_handlers():
+    for h in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_post):
+        if _style_colliders_handler not in h:
+            h.append(_style_colliders_handler)
+
+
+def unregister_handlers():
+    for h in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_post):
+        if _style_colliders_handler in h:
+            h.remove(_style_colliders_handler)
+
+
+class PDSTAGE_OT_toggle_broken_parts(bpy.types.Operator):
+    """Hide all break_, collider_broken_ and stay_ objects (the broken state of breakable objects); click again
+    to show them. Export always hides them first"""
+    bl_idname = 'pdstage.toggle_broken_parts'
+    bl_label = 'Hide Broken Parts'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        parts = broken_parts(context.scene)
+        if not parts:
+            self.report({'INFO'}, 'No break_, collider_broken_ or stay_ objects in this scene')
+            return {'CANCELLED'}
+        hide = any(not _hidden(o) for o in parts)
+        n = set_broken_parts_hidden(context, hide)
+        self.report({'INFO'}, '%s %d broken parts' % ('Hid' if hide else 'Showed', n))
         return {'FINISHED'}
 
 
@@ -403,10 +522,11 @@ class PDSTAGE_OT_restore(bpy.types.Operator):
 
 
 class PDSTAGE_PT_sidebar(bpy.types.Panel):
-    bl_label = 'Phantom Dust Stage'
+    bl_label = 'Map'
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Phantom Dust'
+    bl_order = 0
 
     def draw(self, context):
         s = context.scene
@@ -424,8 +544,17 @@ class PDSTAGE_PT_sidebar(bpy.types.Panel):
         col.label(text='Add at 3D cursor')
         grid = col.grid_flow(columns=2, align=True)
         for k, name, _d in SPAWN_ITEMS:
-            icon = {'JUMP_PAD': 'TRIA_UP_BAR', 'RESTRICTED': 'CANCEL', 'BREAKABLE': 'MOD_EXPLODE', 'STEAM': 'SHADERFX'}[k]
+            icon = {'JUMP_PAD': 'TRIA_UP_BAR', 'RESTRICTED': 'CANCEL', 'BREAKABLE': 'MOD_EXPLODE', 'STEAM': 'SHADERFX',
+                    'RT_LIGHT': 'LIGHT_POINT', 'SHADOW_BOX': 'MOD_MASK'}[k]
             grid.operator(PDSTAGE_OT_spawn_example.bl_idname, text=name, icon=icon).kind = k
+        parts = broken_parts(s)
+        shown = any(not _hidden(o) for o in parts)
+        col.operator(PDSTAGE_OT_toggle_broken_parts.bl_idname,
+                     text='Hide Broken Parts' if shown or not parts else 'Show Broken Parts',
+                     icon='HIDE_ON' if shown or not parts else 'HIDE_OFF')
+        col.operator('pdstage.stretch_shadow_casters', icon='LIGHT_SUN')
+        from . import guides
+        guides.draw_settings(col, context)
         col = lay.column(align=True)
         col.label(text='2. Light')
         from . import lightbake
@@ -442,11 +571,12 @@ class PDSTAGE_PT_sidebar(bpy.types.Panel):
         col.prop(s, 'pd_game_original', text='Replaces')
         col.operator('export_scene.phantom_dust_stage', text='Export...', icon='EXPORT')
         col.operator(PDSTAGE_OT_restore.bl_idname, icon='LOOP_BACK')
-        n = {r: len(exporter.collections_with_role(s, r)) for r in ('VISUALS', 'COLLIDERS', 'SPAWNS', 'OBJECTS', 'EFFECTS')}
+        n = {r: len(exporter.collections_with_role(s, r)) for r in ('VISUALS', 'COLLIDERS', 'SHADOWS', 'SPAWNS', 'OBJECTS',
+                                                                    'EFFECTS')}
         box = lay.box()
         box.label(text='Collections in this scene:')
-        for r, label in (('VISUALS', 'Visuals'), ('COLLIDERS', 'Colliders'), ('SPAWNS', 'Spawn Points'),
-                         ('OBJECTS', 'Objects'), ('EFFECTS', 'Effects')):
+        for r, label in (('VISUALS', 'Visuals'), ('COLLIDERS', 'Colliders'), ('SHADOWS', 'Shadow Casters'),
+                         ('SPAWNS', 'Spawn Points'), ('OBJECTS', 'Objects'), ('EFFECTS', 'Effects')):
             box.label(text='%s: %s' % (label, n[r] or 'none (game original kept)' if r in ('VISUALS', 'COLLIDERS', 'SPAWNS') else n[r]),
                       icon='CHECKMARK' if n[r] else 'DOT')
         tris = _triangle_count(stage_meshes(s))
@@ -465,4 +595,5 @@ class PDSTAGE_PT_sidebar(bpy.types.Panel):
             box.label(text='game on load: use simpler colliders', icon='BLANK1')
 
 
-classes = (PDSTAGE_OT_new_map, PDSTAGE_OT_spawn_example, PDSTAGE_OT_restore, PDSTAGE_PT_sidebar)
+classes = (PDSTAGE_OT_new_map, PDSTAGE_OT_spawn_example, PDSTAGE_OT_toggle_broken_parts, PDSTAGE_OT_restore,
+           PDSTAGE_PT_sidebar)

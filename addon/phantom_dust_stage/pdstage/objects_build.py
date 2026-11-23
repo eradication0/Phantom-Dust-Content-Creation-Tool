@@ -9,6 +9,10 @@ How the game uses them (PDUWP.exe FUN_140203720 / FUN_140203dc0, and Esper-RE st
 - Placement tables (header 0x04 + 4*slot, count at 0x30 + 4*slot): 0x24-byte entries: s32 object index,
   u8 category, u8 type, u8, u8, u32 0, f32 position[3], f32 rotation[3] (radians). A match uses slot
   (layout + 1) and falls back to slot 0.
+- Object sounds (header 0xF8): one 16-byte entry per object (8 x u16, FFFF = none): [1] the sound when it is hit or
+  breaks, [2] the sound of its loose pieces hitting things (an index into the game's sound pairs, 0x1402dc640).
+  There must be an entry for every object: a piece of an object past the end of the table plays a garbage sound
+  number and crashes the game (FUN_140240a00) the first time it hits something.
 - category/type choose the object's class through the game's factory table (0x1402dc4f0). Category 2 is the
   destructible family; see PRESETS.
 
@@ -50,6 +54,28 @@ PRESETS = {
     'RUBBLE':      (2, 74, 'Breaks; debris flies off (rubble)', 'ID'),
     'GAME':        (None, None, 'Kept as the imported map had it', 'IBD'),
 }
+
+# Object sounds (header 0xF8 entries): the values the game's own objects use, with what uses them
+BREAK_SOUNDS = [         # [1]: when it is hit or breaks
+    (0xFFFF, 'No sound', 'Silent (some of the game\'s own fences and signs)'),
+    (0x11, 'Light metal', 'Barricades, cones, street lamps, road signs, handrails (Spiral Highway)'),
+    (0x13, 'Wall', 'Walls, pillars, handrails (Lost Palace)'),
+    (0x14, 'Wooden furniture', 'Benches, chairs, tables (Lost Palace)'),
+    (0x15, 'Glass', 'Glass handrails (Lost Palace)'),
+    (0x16, 'Concrete', 'Bridges, floors, broken gates, containers'),
+    (0x17, 'Heavy metal', 'Cars, oil cans, tanks'),
+    (0x18, 'Iron road', 'Iron road sections (Spiral Highway)'),
+    (0x19, 'Big metal', 'Containers, helicopter (Lunar Plains)'),
+    (0x1A, 'Cardboard', 'Gift boxes, cardboard boxes'),
+    (0x1C, 'Office chair', 'Office chairs (Silent Sanctuary)'),
+    (0x1D, 'Railing', 'Fences, guardrails, handrails (Lunar Plains)'),
+]
+PIECE_SOUNDS = [         # [2]: its loose pieces hitting things
+    (0xFFFF, 'No sound', 'Silent (most of the game\'s own objects)'),
+    (0x24, 'Heavy rubble', 'Walls, pillars, containers, helicopter'),
+    (0x25, 'Glass shards', 'Glass handrails'),
+    (0x26, 'Concrete pieces', 'Bridges, floors, broken gates'),
+]
 
 # Types whose class moves the object by its own animation (Mvan): without one the game crashes on load
 NEEDS_ANIMATION = {(2, 6), (2, 26)}
@@ -175,6 +201,14 @@ def add_objects(b, objects, placements):
         tail = (0, NONE) if i == 0 else (NONE, NONE)
         buf += struct.pack('<3I9I2I', *roots, *offs, *tail)
 
+    # object sounds: one entry for every object (see the notes at the top); imported ones keep the map's own
+    buf += b'OS00'
+    snd_off = len(buf)
+    for o in objects:
+        snd = list(o.get('sounds') or [])[:8]
+        snd += [0xFFFF] * (8 - len(snd))
+        buf += struct.pack('<8H', *[int(x) & 0xFFFF for x in snd])
+
     # one placement table, used by every layout (slot 0 is the fallback for all of them)
     buf += b'PS00'
     ps_off = len(buf)
@@ -185,6 +219,7 @@ def add_objects(b, objects, placements):
     struct.pack_into('<I', buf, dat.H_NAMES, names_off)
     struct.pack_into('<I', buf, dat.H_OBJECT_COUNT, len(objects))
     struct.pack_into('<I', buf, dat.H_OBJECTS, ob_off)
+    struct.pack_into('<I', buf, dat.H_OBJECT_SOUNDS, snd_off)
     for slot in range(11):
         struct.pack_into('<I', buf, dat.H_LAYOUT_SLOTS + 4 * slot, ps_off if slot == 0 else NONE)
         struct.pack_into('<I', buf, dat.H_LAYOUT_COUNTS + 4 * slot, len(placements) if slot == 0 else NONE)

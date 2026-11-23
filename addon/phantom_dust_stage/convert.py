@@ -37,6 +37,7 @@ ROLES = [
     ('EFFECTS', 'Effects', 'Ambient effects: each child collection is one effect type (steam, sparks, smoke); '
                            'every object directly in it is one placement'),
     ('LIGHTING', 'Lighting', 'The sun and lamps Bake Lighting uses (not exported themselves)'),
+    ('SHADOWS', 'Shadow Casters', 'Closed meshes that cast the real-time character shadows in game (not drawn)'),
 ]
 
 

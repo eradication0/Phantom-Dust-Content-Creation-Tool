@@ -32,8 +32,9 @@ NODE_NAME = 'PD Bake Target'
 IMAGE_PREFIX = 'PDBake_'          # the texture the export uses: texture x light
 LIGHT_PREFIX = 'PDLight_'         # the light alone (the light map the PD shader shows)
 
+BIG_LAMP = 2.0          # m: a point/spot lamp's Radius above this leaves the surfaces inside it unlit
 MARGIN = 8              # px of colour bled past each UV island, so mip levels show no seams
-MAX_SIZE = 1024         # the export writes textures up to 1024 (the export's light map budget can shrink them)
+MAX_SIZE = 1024         # baked up to 1024; the export writes at most 512 (visuals_export.MAX_TEX)
 DENSITY = 16.0          # light map pixels per metre
 UV_FILL = 0.55          # share of a light map the UV islands cover (gaps, margins, packing)
 UV_GAP = 0.02           # space between islands in the light map UVs
@@ -47,10 +48,11 @@ def register_props():
     S = bpy.types.Scene
     P = bpy.props
     S.pd_bake_max_size = P.EnumProperty(
-        name='Max light map size', default='1024',
+        name='Max light map size', default='512',
         items=[(str(n), '%d x %d' % (n, n), '') for n in (128, 256, 512, 1024)],
         description='Largest light map one mesh can get (big meshes are capped here: softer shadows, smaller '
-                    'file). Meshes get 16 pixels per metre up to this')
+                    'file). Meshes get 16 pixels per metre up to this. The export writes at most 512 x 512 (bigger '
+                    'textures break in game), so 1024 only gives a smoother downscale')
     S.pd_bake_samples = P.IntProperty(name='Samples', default=64, min=1, max=8192,
                                       description='Render samples per texel: more = less noise, slower')
     S.pd_bake_bounces = P.IntProperty(name='Light bounces', default=3, min=0, max=32,
@@ -97,7 +99,7 @@ def _see_through(ob):
         if m is None:
             continue
         st = pd_material.read(m)
-        if st['diffuse'] is not None and pd_material.alpha_kind(st['diffuse']) != 'NONE':
+        if st.get('transparent') or st.get('scroll') or (st['diffuse'] is not None and pd_material.alpha_kind(st['diffuse']) != 'NONE'):
             return True
     return False
 
@@ -558,6 +560,14 @@ class PDSTAGE_OT_bake_light(bpy.types.Operator):
         if not receivers:
             self.report({'ERROR'}, 'Nothing to bake: no visible meshes under Visuals or Objects')
             return {'CANCELLED'}
+        big = ['%s (%.1f m)' % (o.name, o.data.shadow_soft_size) for o in lights(scene)
+               if o.data.type in ('POINT', 'SPOT') and o.data.shadow_soft_size > BIG_LAMP]
+        if big:
+            # Cycles' point and spot lamps are spheres of this radius: surfaces inside the sphere get no light
+            msg = ('Lamp radius too big: %s. Surfaces inside a lamp\'s radius get no light from it; set Radius '
+                   'below %.0f m (Light properties)' % (', '.join(big), BIG_LAMP))
+            print('Phantom Dust bake:', msg)
+            self.report({'WARNING'}, msg)
         if context.object is not None and context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         if scene.pd_bake_show:
@@ -625,13 +635,28 @@ class PDSTAGE_OT_bake_light(bpy.types.Operator):
                         saved['coll_hidden'][c.name] = True
                         c.hide_render = False
                     c = parents.get(c.name)
-            if o.type == 'MESH':
+            if o.type in ('MESH', 'LIGHT'):                 # a lamp with Diffuse rays off lights nothing
                 saved['rays'][o.name] = tuple(getattr(o, f, True) for f in flags) + (getattr(o, 'is_holdout', False),)
                 for f in flags:
                     if hasattr(o, f):
                         setattr(o, f, True)
                 if hasattr(o, 'is_holdout'):
                     o.is_holdout = False
+        # a collection unticked in the outliner (excluded from the view layer) is left out of renders too: include
+        # the ones holding a light or a mesh of the bake (lamps in the Lighting collection, point lights included)
+        saved['excluded'] = []
+
+        def include(lc):
+            hit = False
+            for ch in lc.children:
+                inner = include(ch)
+                if (inner or any(o in keep for o in ch.collection.objects)) and ch.exclude:
+                    ch.exclude = False
+                    saved['excluded'].append(ch.collection.name)
+                hit = hit or inner or any(o in keep for o in ch.collection.objects)
+            return hit
+
+        include(context.view_layer.layer_collection)
         scene.render.engine = 'CYCLES'
         scene.cycles.samples = scene.pd_bake_samples
         scene.cycles.max_bounces = max(scene.pd_bake_bounces, 1)
@@ -715,6 +740,13 @@ class PDSTAGE_OT_bake_light(bpy.types.Operator):
         phase = _state.get('phase')
         _state['alive'] = time.time()
         if _state.get('result'):
+            # Blender fires bake_complete while its bake job is still shutting down (render engine, depsgraph
+            # and the images it wrote still in use on the job thread). Swapping materials back, removing the
+            # bake's temporary materials and starting the glow bake right then crashed about every other bake.
+            # Wait until the job is really gone, plus a moment.
+            since = _state.setdefault('result_at', time.time())
+            if _job_running() or time.time() - since < SETTLE:
+                return {'RUNNING_MODAL'}
             ok = _state['result'] == 'done'
             self._finish(context, ok)
             return {'FINISHED'} if ok else {'CANCELLED'}
@@ -817,8 +849,7 @@ class PDSTAGE_OT_bake_light(bpy.types.Operator):
                 slot.link = link
                 if link == 'OBJECT' and mat:
                     slot.material = bpy.data.materials.get(mat)
-            for m in [m for m in bpy.data.materials if m.name.startswith(TMP_PREFIX)]:
-                bpy.data.materials.remove(m)
+            _remove_tmp_later()                             # not now: Cycles may still hold them (see modal)
             scene.render.engine = s['engine']
             scene.cycles.samples = s['samples']
             scene.cycles.max_bounces = s['max_b']
@@ -850,6 +881,13 @@ class PDSTAGE_OT_bake_light(bpy.types.Operator):
                 c = bpy.data.collections.get(cname)
                 if c is not None:
                     c.hide_render = True
+            if s.get('excluded'):
+                def exclude(lc):
+                    for ch in lc.children:
+                        if ch.collection.name in s['excluded']:
+                            ch.exclude = True
+                        exclude(ch)
+                exclude(context.view_layer.layer_collection)
             for o in context.view_layer.objects:
                 o.select_set(o.name in s['sel'])
             if s['active'] and s['active'] in bpy.data.objects:
@@ -932,12 +970,39 @@ class PDSTAGE_OT_bake_light(bpy.types.Operator):
             area.tag_redraw()
 
 
+SETTLE = 1.0                  # seconds after the bake job ends before the scene is put back
+
+
+def _job_running():
+    try:
+        return bpy.app.is_job_running('OBJECT_BAKE') or bpy.app.is_job_running('RENDER')
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _remove_tmp_later(delay=3.0):
+    """Remove the bake's temporary materials a few seconds later, once nothing (bake job, viewport render)
+    can still use them; only ones no slot uses any more."""
+    def run():
+        if _job_running():
+            return 1.0
+        for m in [m for m in bpy.data.materials if m.name.startswith(TMP_PREFIX) and m.users == 0]:
+            try:
+                bpy.data.materials.remove(m)
+            except (ReferenceError, RuntimeError):
+                pass
+        return None
+    bpy.app.timers.register(run, first_interval=delay)
+
+
 def _on_done(*_args):
     _state['result'] = 'done'
+    _state['result_at'] = time.time()
 
 
 def _on_cancel(*_args):
     _state['result'] = 'cancel'
+    _state['result_at'] = time.time()
 
 
 def _clock(sec):

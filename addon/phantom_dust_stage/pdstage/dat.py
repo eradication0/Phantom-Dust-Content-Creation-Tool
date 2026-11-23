@@ -20,6 +20,7 @@ H_COLLISION = 0x94
 H_EF00 = 0x98
 H_SP00 = 0x9C
 H_MD00 = 0xA0           # MD00 stage models list
+H_OBJECT_SOUNDS = 0xF8  # 16 bytes per object (8 x u16, FFFF = none): [1] its hit/break sound, [2] its pieces' impact sound
 H_FILE_SIZE = 0x138      # equals the file size in every map
 
 

@@ -14,8 +14,10 @@ UV map (the game reads them as stored: tangent = +U, binormal = +V in Blender's 
 normal maps work unchanged).
 
 Textures: an image whose name matches a texture in the game original (as the import names them) reuses that
-texture. Others are added uncompressed, resized to a power of two (largest side at most 1024) with a full mip
-chain. A reflection map's alpha is multiplied by the material's Reflection Strength.
+texture. Others are added resized to a power of two (largest side at most 512), DXT1/DXT5 compressed with a full
+mip chain like the game's own. (Plain BGRA with mip levels showed rainbow streaks at a distance in game: the game
+never uses that format above 128 px, so "Uncompressed" now writes the top level only, as its own plain textures.)
+A reflection map's alpha is multiplied by the material's Reflection Strength.
 """
 import math
 
@@ -31,7 +33,8 @@ from . import pd_material
 
 SLOTS = (('background', 1), ('sky', 2))
 LIGHT_LAYER = 'PD_Light'
-MAX_TEX = 1024
+MAX_TEX = 512          # the game's own textures are at most ~0.7 MB each (512 px); a 1024 light map
+                       # (1.4 MB) drew rainbow streaks at a distance, as did plain 512 px textures (1.4 MB)
 UV_LIMIT = 7.99                      # UVs are stored as int16 / 4096
 LM_UV_LIMIT = 15.99                  # light-mapped meshes (lbts): uint16 / 4096
 
@@ -75,7 +78,7 @@ def game_texture_name(name):
 
 
 def image_levels(img, alpha_scale=1.0, normal_strength=1.0, lightmap_ambient=None, max_size=MAX_TEX,
-                 lightmap_glow=None, tint=(1.0, 1.0, 1.0)):
+                 lightmap_glow=None, tint=(1.0, 1.0, 1.0), alpha_value=None):
     """(width, height, [BGRA bytes per mip, top row first]) for a Blender image (alpha times alpha_scale; a normal
     map's bumps scaled by normal_strength: x and y times the strength, then made unit length again)."""
     w, h = img.size
@@ -87,8 +90,13 @@ def image_levels(img, alpha_scale=1.0, normal_strength=1.0, lightmap_ambient=Non
     if lightmap_ambient is not None:
         # a baked light map for the lbts shader, which draws texture x (ambient + light map): the baked light
         # (sun, lamps, bounces; the game adds the stage ambient itself) is stored as is. Alpha 0 (the shader adds the light map once more by its alpha)
-        px[..., :3] = np.clip(px[..., :3], 0.0, 1.0)
-        px[..., 3] = 0.0
+        # Light brighter than white (lamps up close: the bake is a float image) goes into the alpha: the shader
+        # adds light map x alpha once more on top, untextured, like the campaign's lamp hot spots. Alpha = the
+        # part above white as a share of the stored light (at most 1: up to twice the light, then white).
+        raw = px[..., :3].copy()
+        px[..., :3] = np.clip(raw, 0.0, 1.0)
+        over = (raw - px[..., :3]).max(axis=-1)
+        px[..., 3] = np.clip(over / np.maximum(px[..., :3].max(axis=-1), 1e-4), 0.0, 1.0)
         if lightmap_glow is not None and tuple(lightmap_glow.size) == (w, h):
             # glow (Emission Map): the shader adds light map x alpha on top, so where something glows the light
             # map gets at least the glow colour and its alpha the share that makes light map x alpha = glow
@@ -99,9 +107,12 @@ def image_levels(img, alpha_scale=1.0, normal_strength=1.0, lightmap_ambient=Non
             on = peak > 1.0 / 255
             lit = np.where(on[..., None], np.maximum(px[..., :3], g), px[..., :3])
             px[..., :3] = lit
-            px[..., 3] = np.where(on, np.clip(peak / np.maximum(lit.max(axis=-1), 1e-4), 0.0, 1.0), 0.0)
+            px[..., 3] = np.maximum(px[..., 3], np.where(on, np.clip(peak / np.maximum(lit.max(axis=-1), 1e-4),
+                                                                      0.0, 1.0), 0.0))
     if alpha_scale != 1.0:
         px[..., 3] *= alpha_scale
+    if alpha_value is not None:                                # a fixed alpha (scrolling normal maps)
+        px[..., 3] = alpha_value
     if tuple(tint) != (1.0, 1.0, 1.0):                         # the material's Diffuse Color
         px[..., :3] *= np.array(tint, dtype=np.float32)
     if normal_strength != 1.0:
@@ -154,9 +165,10 @@ class Textures:
     """Texture references shared by every model in one export: map textures reused by name, others added."""
 
     def __init__(self, base_textures, compress=False):
-        # 'ALL' / True: DXT1/DXT5 like the game's own; 'NONE' / False: plain BGRA; 'AUTO': plain BGRA, then
-        # finish() compresses the biggest ones until the new textures fit the budget
-        self.mode = {True: 'ALL', False: 'NONE'}.get(compress, compress)
+        # 'NONE': plain BGRA, top level only (finish() drops the mip levels); anything else: DXT1/DXT5 with mip
+        # levels like the game's own. Plain BGRA *with* mip levels drew rainbow streaks in game (the game's own
+        # plain textures are at most 128 px), so it is never written; the old 'AUTO' now means compressed.
+        self.mode = 'NONE' if compress == 'NONE' else 'ALL'
         self.compress = self.mode == 'ALL'
         self.base_by_name = {t['name']: t['index'] for t in base_textures}
         self.new = []
@@ -165,24 +177,29 @@ class Textures:
         self.key = {}
         self.reused = 0
 
-    def ref(self, img, alpha_scale=1.0, normal_strength=1.0, tint=(1.0, 1.0, 1.0)):
-        """Texture ref for an image (times `tint`, sRGB 0-1); no image: a 4 x 4 texture of the colour `tint`."""
+    def ref(self, img, alpha_scale=1.0, normal_strength=1.0, tint=(1.0, 1.0, 1.0), alpha_value=None):
+        """Texture ref for an image (times `tint`, sRGB 0-1); no image: a 4 x 4 texture of the colour `tint`.
+        alpha_value: every pixel's alpha set to it (0-1)."""
         tint = tuple(round(max(0.0, min(1.0, x)), 3) for x in tint)
-        key = (img.name if img is not None else None, round(alpha_scale, 3), round(normal_strength, 3), tint)
+        key = (img.name if img is not None else None, round(alpha_scale, 3), round(normal_strength, 3), tint,
+               alpha_value)
         if key in self.key:
             return self.key[key]
         if img is None:
             ref = ('new', len(self.new))
-            px = bytes(int(round(c * 255)) for c in (tint[2], tint[1], tint[0])) + b'\xff'      # BGRA
+            a = int(round(max(0.0, min(1.0, alpha_scale)) * 255))
+            px = bytes(int(round(c * 255)) for c in (tint[2], tint[1], tint[0])) + bytes((a,))   # BGRA
             name = 'pd_white' if tint == (1.0, 1.0, 1.0) else 'pd_c%02x%02x%02x' % tuple(int(round(c * 255))
                                                                                     for c in tint)
+            if a != 255:
+                name += '_a%02x' % a
             self.new.append(dict(name=name, width=4, height=4, levels=[px * 16, px * 4, px]))
-        elif alpha_scale == 1.0 and normal_strength == 1.0 and tint == (1.0, 1.0, 1.0) \
+        elif alpha_scale == 1.0 and normal_strength == 1.0 and tint == (1.0, 1.0, 1.0) and alpha_value is None \
                 and game_texture_name(img.name) in self.base_by_name:
             ref = ('base', self.base_by_name[game_texture_name(img.name)])
             self.reused += 1
         else:
-            w, h, levels = image_levels(img, alpha_scale, normal_strength, tint=tint)
+            w, h, levels = image_levels(img, alpha_scale, normal_strength, tint=tint, alpha_value=alpha_value)
             import hashlib
             digest = (w, h, hashlib.md5(b''.join(levels)).digest())   # copies of one image (wall.001...) once
             ref = self.by_content.get(digest)
@@ -197,21 +214,18 @@ class Textures:
         return ref
 
     def finish(self, budget_bytes, skip=()):
-        """Fit all new textures (light maps have their own budget: `skip`) into `budget_bytes`: in AUTO mode the
-        biggest plain textures are compressed first; if they still don't fit (any mode), the biggest are halved
-        (their top mip level dropped) until they do. Returns (compressed, halved)."""
+        """Fit all new textures (light maps have their own budget: `skip`) into `budget_bytes`: compressed (or, in
+        NONE mode, cut to their top level, see __init__), the biggest halved (top mip level dropped) until they
+        fit. Returns (0, halved): nothing is compressed just to fit any more."""
         size = lambda t: sum(len(l) for l in t['levels'])
         mine = [t for t in self.new if id(t) not in skip]
         total = sum(size(t) for t in mine)
         n = 0
-        if self.mode == 'AUTO':
-            for t in sorted((t for t in mine if 'format' not in t), key=size, reverse=True):
-                if total <= budget_bytes:
-                    break
-                before = size(t)
-                t.update(compress(t['levels'], t['width'], t['height']))
-                total += size(t) - before
-                n += 1
+        if self.mode == 'ALL':          # the small plain helpers (pd_white, pd_flatnrm...) compressed too
+            for t in mine:
+                if 'format' not in t:
+                    t.update(compress(t['levels'], t['width'], t['height']))
+            total = sum(size(t) for t in mine)
         halved = 0
         while total > budget_bytes:
             t = max(mine, key=size)
@@ -224,6 +238,12 @@ class Textures:
                 t['mips'] = len(t['levels'])
             total += size(t) - before
             halved += 1
+        if self.mode == 'NONE':         # plain textures: top level only (see __init__)
+            for t in mine:
+                if 'format' not in t and len(t['levels']) > 1:
+                    t['levels'] = t['levels'][:1]
+                    t['mips'] = 1
+            total = sum(size(t) for t in mine)
         self.auto_total = total
         return n, halved
 
@@ -243,7 +263,7 @@ class Textures:
         written: compressed light maps take a byte per pixel, plain ones four). Returns how many were shrunk."""
         if not self.lightmaps:
             return 0
-        per_px = 4 if self.mode == 'NONE' else 1
+        per_px = 1                                                   # always DXT5 (see __init__)
         sizes = [min(MAX_TEX, 1 << int(math.floor(math.log2(max(1, min(img.size[0], img.size[1]))))))
                  for _t, img, _a, _g in self.lightmaps]
         cost = lambda z: z * z * per_px * 4 // 3                     # with the mip levels
@@ -257,8 +277,7 @@ class Textures:
         for (t, img, ambient, glow), z in zip(self.lightmaps, sizes):
             w, h, levels = image_levels(img, lightmap_ambient=ambient, max_size=z, lightmap_glow=glow)
             t.update(width=w, height=h, levels=levels)
-            if self.mode != 'NONE':                                  # DXT5: keeps the alpha at 0
-                t.update(compress(levels, w, h))
+            t.update(compress(levels, w, h))                         # DXT5: keeps the alpha at 0
         self.lightmap_bytes = sum(sum(len(l) for l in t['levels']) for t, _i, _a, _g in self.lightmaps)
         return len(shrunk)
 
@@ -271,12 +290,39 @@ class Textures:
                                  levels=[b'\xff\x80\x80\xff' * 16, b'\xff\x80\x80\xff' * 4, b'\xff\x80\x80\xff']))
         return self.key[key]
 
+    # Scrolling (sbtscloud3) works its alpha out from the colour texture's and both normal maps' alphas ("overlay"):
+    # normal maps with alpha 127/255 leave the colour texture's alpha as it is (alr_build.SCROLL_TEMPLATE)
+    SCROLL_NORMAL_ALPHA = 127 / 255
+
+    def scroll_flat_normal(self):
+        key = ('scroll_flat_normal',)
+        if key not in self.key:
+            self.key[key] = ('new', len(self.new))
+            px = b'\xff\x80\x80\x7f'                                # BGRA: flat, alpha 127
+            self.new.append(dict(name='pd_flatscr', width=4, height=4, levels=[px * 16, px * 4, px]))
+        return self.key[key]
+
     def material(self, settings):
         """Writer material dict (texture refs, highlight) for pd_material.read() settings."""
         tint = settings.get('diffuse_tint', (1.0, 1.0, 1.0))
         if settings['diffuse'] is None and settings.get('pd'):    # no texture: the Diffuse colour
             tint = tuple(a * b for a, b in zip(settings.get('diffuse_colour', (1.0, 1.0, 1.0)), tint))
-        return dict(diffuse=self.ref(settings['diffuse'], tint=tint),
+        if settings.get('scroll'):
+            blend = settings.get('scroll_blend', 'OPAQUE')
+            fade = 1.0 - settings.get('transparency', 0.0) if blend == 'ALPHA' else 1.0
+            strength = settings.get('normal_strength', 1.0)
+            na = self.ref(settings['normal'], normal_strength=strength, alpha_value=self.SCROLL_NORMAL_ALPHA) \
+                if settings['normal'] is not None else self.scroll_flat_normal()
+            nb_img = settings.get('normal_b') or settings['normal']
+            nb = self.ref(nb_img, normal_strength=strength, alpha_value=self.SCROLL_NORMAL_ALPHA) \
+                if nb_img is not None else self.scroll_flat_normal()
+            return dict(diffuse=self.ref(settings['diffuse'], fade, tint=tint), transparent=False, normal=na,
+                        reflection=None, specular=(0, 0, 0, 0),
+                        scroll=dict(normal_a=na, normal_b=nb, speeds=tuple(settings['scroll_speeds']), blend=blend))
+        see = bool(settings.get('transparent'))      # blended shader (..al): the slider fades the texture's alpha
+        return dict(diffuse=self.ref(settings['diffuse'], 1.0 - settings.get('transparency', 0.0) if see else 1.0,
+                                     tint=tint),
+                    transparent=see,
                     normal=self.ref(settings['normal'], normal_strength=settings.get('normal_strength', 1.0))
                     if settings['normal'] is not None else None,
                     reflection=self.ref(settings['reflection'], settings['reflection_strength'])
@@ -361,7 +407,11 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
             if mi not in settings:
                 st = pd_material.read(mat)
                 gmat = textures.material(st)
-                if lm_ref is not None:                          # light-mapped: lbts (no reflection map)
+                if gmat.get('scroll'):                  # scrolling: tangents always, white light, alpha 255
+                    st = dict(st, normal=st['normal'] or 'flat', light=('const', (255, 255, 255)),
+                              shine=('const', 1.0))
+                elif lm_ref is not None and not gmat['transparent']:   # light-mapped: lbts (no reflection map;
+                    # lbts has no blended variant, so transparent materials keep vertex light)
                     gmat = dict(diffuse=gmat['diffuse'], lightmap=lm_ref,
                                 normal=gmat['normal'] or textures.flat_normal(), reflection=None,
                                 specular=gmat['specular'])

@@ -28,7 +28,7 @@ from mathutils import Vector
 
 GROUP = 'PD Stage Shader'
 SPHERE_GROUP = 'PD Sphere Map'
-GROUP_VERSION = 11
+GROUP_VERSION = 13
 LIGHT_LAYER = 'PD_Light'
 SHINE_LAYER = 'PD_Shine'
 MAPS = ('Diffuse', 'Normal Map', 'Reflection Map', 'Emission Map')
@@ -257,9 +257,23 @@ def _contents(ng):
     links.new(emit.outputs['Emission'], pick.inputs[2])
     # like the game's lbts shader: texture x (stage ambient + light map), the light map holding sun and lamps only
     # (in the game's gamma space, like the game look: texture x (ambient + light map), then back to linear)
-    lm_amb = mix(gi.outputs['Light Map'], amb_col.outputs[0], 'ADD', loc=(250, -400))
-    lm = gamma(mix(gamma(diffuse, 1 / GAMMA, (250, -250)), lm_amb, 'MULTIPLY', loc=(400, -400),
-                   clamp=True), GAMMA, (480, -400))
+    # the export clips the light map to 0-1 (an 8-bit texture): so does the preview (Blender's bake is HDR)
+    lm_clip = mix(gi.outputs['Light Map'], (1.0, 1.0, 1.0, 1.0), 'MULTIPLY', loc=(100, -400), clamp=True)
+    lm_amb = mix(lm_clip, amb_col.outputs[0], 'ADD', loc=(250, -400))
+    # light above white: the export puts it into the light map's alpha, which the game adds on top untextured
+    # (light map x alpha, alpha = the part above white / the stored light, at most 1)
+    sep_over = node('ShaderNodeSeparateColor', (100, -550))
+    links.new(mix(gi.outputs['Light Map'], lm_clip, 'SUBTRACT', loc=(0, -550)), sep_over.inputs[0])
+    sep_lm = node('ShaderNodeSeparateColor', (100, -650))
+    links.new(lm_clip, sep_lm.inputs[0])
+    over = math_('MAXIMUM', math_('MAXIMUM', sep_over.outputs[0], sep_over.outputs[1], loc=(180, -550)),
+                 sep_over.outputs[2], loc=(240, -550))
+    peak = math_('MAXIMUM', math_('MAXIMUM', sep_lm.outputs[0], sep_lm.outputs[1], loc=(180, -650)),
+                 sep_lm.outputs[2], loc=(240, -650))
+    hot_a = math_('DIVIDE', over, math_('MAXIMUM', peak, 0.0001, loc=(300, -650)), loc=(340, -600), clamp=True)
+    hot = mix(lm_clip, hot_a, 'MULTIPLY', loc=(380, -560))
+    lm = gamma(mix(mix(gamma(diffuse, 1 / GAMMA, (250, -250)), lm_amb, 'MULTIPLY', loc=(400, -400)), hot, 'ADD',
+                   loc=(440, -420), clamp=True), GAMMA, (480, -400))
     glow = mix(glow_col, gi.outputs['Emission Strength'], 'MULTIPLY', loc=(400, -600))
     lm = mix(lm, glow, 'ADD', loc=(520, -450))                   # the light map's glow, added as the game does
     lm_emit = node('ShaderNodeEmission', (650, -400))
@@ -462,6 +476,57 @@ def _on_load(_dummy):
     sync_preview(force=True)
 
 
+def _transparency_changed(self, context):
+    try:
+        apply_alpha(self)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+
+
+def register_props():
+    bpy.types.Material.pd_transparent = bpy.props.BoolProperty(
+        name='Transparent', default=False, update=_transparency_changed,
+        description='Draw see-through in game (the blended shader, e.g. sdal): by the diffuse texture\'s alpha '
+                    'and the Transparency slider. No light map on these meshes (the game has no blended '
+                    'light-mapped shader)')
+    bpy.types.Material.pd_transparency = bpy.props.FloatProperty(
+        name='Transparency', default=0.0, min=0.0, max=1.0, subtype='FACTOR', update=_transparency_changed,
+        description='0: the texture\'s own alpha; 1: invisible. Baked into the exported texture\'s alpha')
+
+
+    bpy.types.Material.pd_scroll = bpy.props.BoolProperty(
+        name='Scrolling', default=False, update=_scroll_changed,
+        description='Scroll the textures in game: the sky\'s cloud shader (sbtscloud3), lit by the map\'s light, '
+                    'with a speed for the colour texture and for each of two normal maps. No light map, '
+                    'reflection or highlight on these meshes')
+    vec = dict(size=2, default=(0, 0), min=-32768, max=32767, soft_min=-3000, soft_max=3000,
+               update=_scroll_changed)
+    bpy.types.Material.pd_scroll_colour = bpy.props.IntVectorProperty(
+        name='Colour Speed', description='X / Y scroll speed of the colour texture (150 = a slow drift as the '
+                                         'sky\'s clouds, 600 = clearly moving, 0 = still)', **vec)
+    bpy.types.Material.pd_scroll_normal_a = bpy.props.IntVectorProperty(
+        name='Normal A Speed', description='X / Y scroll speed of the normal map', **vec)
+    bpy.types.Material.pd_scroll_normal_b = bpy.props.IntVectorProperty(
+        name='Normal B Speed', description='X / Y scroll speed of the second normal map (added on top of the '
+                                           'first: two layers moving apart make water ripple)', **vec)
+    bpy.types.Material.pd_scroll_normal_b_image = bpy.props.PointerProperty(
+        type=bpy.types.Image, name='Normal Map B',
+        description='The second normal map; none: the first one again (at its own speed)')
+    bpy.types.Material.pd_scroll_blend = bpy.props.EnumProperty(
+        name='Draw', items=SCROLL_BLENDS, default='OPAQUE', update=_scroll_changed,
+        description='How the scrolling surface is drawn')
+
+
+def unregister_props():
+    for k in ('pd_scroll', 'pd_scroll_colour', 'pd_scroll_normal_a', 'pd_scroll_normal_b',
+              'pd_scroll_normal_b_image', 'pd_scroll_blend'):
+        if hasattr(bpy.types.Material, k):
+            delattr(bpy.types.Material, k)
+    for k in ('pd_transparent', 'pd_transparency'):
+        if hasattr(bpy.types.Material, k):
+            delattr(bpy.types.Material, k)
+
+
 def register_preview():
     if not bpy.app.timers.is_registered(_timer):
         bpy.app.timers.register(_timer, first_interval=0.5, persistent=True)
@@ -566,10 +631,13 @@ def setup(mat, diffuse=None, normal=None, reflection=None, specular=(0.0, 0.0, 0
             link_attribute(mat, 'Shine Mask', light_layer, 'Alpha')
     if diffuse is not None:
         apply_alpha(mat, diffuse)
+    if getattr(mat, 'pd_scroll', False):
+        apply_scroll(mat)
     return mat
 
 
 ALPHA_NODE = 'PD Alpha'
+ALPHA_SCALE_NODE = 'PD Alpha Scale'
 
 
 def alpha_kind(img):
@@ -613,11 +681,17 @@ def apply_alpha(mat, img=None):
         nt.nodes.remove(old)
         if tr is not None:
             nt.nodes.remove(tr)
+    old = nt.nodes.get(ALPHA_SCALE_NODE)
+    if old is not None:
+        nt.nodes.remove(old)
     out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
     tex = image_node(mat, 'Diffuse')
     img = img if img is not None else (tex.image if tex is not None else None)
-    kind = alpha_kind(img)
-    if out is None or tex is None or kind == 'NONE':
+    see = transparency(mat)
+    if getattr(mat, 'pd_scroll', False) and mat.pd_scroll_blend != 'OPAQUE':
+        see = dict(transparent=True, transparency=see['transparency'])
+    kind = 'BLEND' if see['transparent'] else alpha_kind(img)
+    if out is None or (tex is None and not see['transparent']) or kind == 'NONE':
         nt.links.new(g.outputs['Shader'], out.inputs['Surface']) if out is not None else None
         return
     tr = nt.nodes.new('ShaderNodeBsdfTransparent')
@@ -626,7 +700,18 @@ def apply_alpha(mat, img=None):
     mx.name = mx.label = ALPHA_NODE
     mx.location = (g.location.x + 300, g.location.y - 100)
     out.location = (g.location.x + 520, g.location.y)
-    nt.links.new(tex.outputs['Alpha'], mx.inputs['Fac'])
+    if see['transparent']:                              # the slider: alpha x (1 - transparency), as exported
+        sc = nt.nodes.new('ShaderNodeMath')
+        sc.operation = 'MULTIPLY'
+        sc.name = sc.label = ALPHA_SCALE_NODE
+        sc.location = (g.location.x + 120, g.location.y - 260)
+        sc.inputs[0].default_value = 1.0
+        sc.inputs[1].default_value = 1.0 - see['transparency']
+        if tex is not None:
+            nt.links.new(tex.outputs['Alpha'], sc.inputs[0])
+        nt.links.new(sc.outputs['Value'], mx.inputs['Fac'])
+    else:
+        nt.links.new(tex.outputs['Alpha'], mx.inputs['Fac'])
     nt.links.new(tr.outputs['BSDF'], mx.inputs[1])
     nt.links.new(g.outputs['Shader'], mx.inputs[2])
     nt.links.new(mx.outputs['Shader'], out.inputs['Surface'])
@@ -721,7 +806,8 @@ def read(mat):
     g = group_node(mat)
     if g is None:
         return dict(pd=False, diffuse=first_image(mat), normal=None, reflection=None, specular=(0, 0, 0, 0),
-                    reflection_strength=1.0, normal_strength=1.0, shine=('const', 1.0), light=None)
+                    reflection_strength=1.0, normal_strength=1.0, shine=('const', 1.0), light=None,
+                    **transparency(mat), **scrolling(mat))
     ins = g.inputs
     sc = ins['Specular Color'].default_value
     spec = tuple(_byte(_srgb(sc[k])) for k in range(3)) + (int(round(ins['Shininess'].default_value)),)
@@ -733,7 +819,85 @@ def read(mat):
                 reflection=_upstream_image(ins['Reflection Map']), specular=spec,
                 reflection_strength=ins['Reflection Strength'].default_value,
                 normal_strength=ins['Normal Strength'].default_value if 'Normal Strength' in ins else 1.0,
-                shine=shine, light=light, **emission(mat), **diffuse_colour(mat))
+                shine=shine, light=light, **emission(mat), **diffuse_colour(mat), **transparency(mat),
+                **scrolling(mat))
+
+
+SCROLL_BLENDS = (('OPAQUE', 'Solid', 'Drawn solid'),
+                 ('ALPHA', 'See-through', 'See-through by the colour texture\'s alpha (and the Transparency slider)'),
+                 ('ADD', 'Glow', 'Added on top of what is behind it, like the sky\'s clouds and glowing energy'))
+SCROLL_PROPS = ('pd_scroll_colour', 'pd_scroll_normal_a', 'pd_scroll_normal_b')
+SCROLL_NODE = 'PD Scroll '
+# preview speed: value / 65536 texture widths per game frame at 60 fps (as the sky preview; an estimate)
+SCROLL_DIV = 65536.0
+GAME_FPS = 60.0
+
+
+def scrolling(mat):
+    """{'scroll': drawn with the scrolling shader (the sky's cloud shader sbtscloud3), 'scroll_speeds': (x, y) for
+    the colour texture, normal map A and normal map B, 'scroll_blend', 'normal_b': the second normal map image}."""
+    on = bool(getattr(mat, 'pd_scroll', False)) if mat is not None else False
+    if not on:
+        return dict(scroll=False)
+    speeds = tuple(int(v) for p in SCROLL_PROPS for v in getattr(mat, p))
+    return dict(scroll=True, scroll_speeds=speeds, scroll_blend=mat.pd_scroll_blend,
+                normal_b=getattr(mat, 'pd_scroll_normal_b_image', None))
+
+
+def apply_scroll(mat):
+    """Preview: a Mapping node in front of the Diffuse and Normal Map image nodes, its offset driven by the frame
+    (press Play) and the material's speeds. Normal map B is not previewed (the shader preview has one normal map)."""
+    if mat is None or mat.node_tree is None:
+        return
+    nt = mat.node_tree
+    for n in [n for n in nt.nodes if n.name.startswith(SCROLL_NODE)]:
+        nt.nodes.remove(n)
+    if not getattr(mat, 'pd_scroll', False) or group_node(mat) is None:
+        return
+    fps = (bpy.context.scene.render.fps / bpy.context.scene.render.fps_base) if bpy.context.scene else 24.0
+    for slot, prop in (('Diffuse', 'pd_scroll_colour'), ('Normal Map', 'pd_scroll_normal_a')):
+        img = image_node(mat, slot)
+        if img is None:
+            continue
+        uv = nt.nodes.new('ShaderNodeTexCoord')
+        uv.name = uv.label = SCROLL_NODE + slot + ' UV'
+        uv.location = (img.location.x - 420, img.location.y)
+        mp = nt.nodes.new('ShaderNodeMapping')
+        mp.name = mp.label = SCROLL_NODE + slot
+        mp.location = (img.location.x - 220, img.location.y)
+        nt.links.new(uv.outputs['UV'], mp.inputs['Vector'])
+        nt.links.new(mp.outputs['Vector'], img.inputs['Vector'])
+        loc = mp.inputs['Location']
+        # game UV + speed x time; Blender's v runs the other way, so y is negated
+        for axis, sign in ((0, ''), (1, '-')):
+            fc = loc.driver_add('default_value', axis)
+            drv = fc.driver
+            drv.type = 'SCRIPTED'
+            v = drv.variables.new()
+            v.name = 's'
+            v.type = 'SINGLE_PROP'
+            v.targets[0].id_type = 'MATERIAL'
+            v.targets[0].id = mat
+            v.targets[0].data_path = '%s[%d]' % (prop, axis)
+            drv.expression = '%ss * frame * %g / (%g * %g)' % (sign, GAME_FPS, SCROLL_DIV, fps)
+
+
+def _scroll_changed(self, context):
+    try:
+        apply_scroll(self)
+        apply_alpha(self)
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+
+
+def transparency(mat):
+    """{'transparent': drawn with the blended shader (sdal...: see-through by the diffuse alpha), 'transparency':
+    0 = the texture's own alpha, 1 = invisible}."""
+    on = bool(getattr(mat, 'pd_transparent', False)) if mat is not None else False
+    if mat is not None and getattr(mat, 'pd_scroll', False):       # scrolling: its own blend setting
+        see = mat.pd_scroll_blend == 'ALPHA'
+        return dict(transparent=False, transparency=float(mat.pd_transparency) if see else 0.0)
+    return dict(transparent=on, transparency=float(getattr(mat, 'pd_transparency', 0.0)) if on else 0.0)
 
 
 def diffuse_colour(mat):
@@ -773,8 +937,11 @@ def glows(mat):
 
 
 def game_shader(settings):
+    if settings.get('scroll'):
+        return 'sbtscloud3'
     return {(False, False): 'sd', (True, False): 'sbts', (False, True): 'sdrefs', (True, True): 'sbtsrefs'}[
-        (settings['normal'] is not None, settings['reflection'] is not None)]
+        (settings['normal'] is not None, settings['reflection'] is not None)] + \
+        ('al' if settings.get('transparent') else '')
 
 
 # ---------------------------------------------------------------- operators and panel
@@ -1060,7 +1227,35 @@ class PDSTAGE_PT_material(bpy.types.Panel):
         s = read(mat)
         names = {'sd': 'simple (sd)', 'sbts': 'normal map (sbts)', 'sdrefs': 'reflection (sdrefs)',
                  'sbtsrefs': 'normal map + reflection (sbtsrefs)'}
-        lay.label(text='Game shader: ' + names[game_shader(s)], icon='SHADING_RENDERED')
+        shader = game_shader(s)
+        if s.get('scroll'):
+            lay.label(text='Game shader: scrolling (sbtscloud3)', icon='SHADING_RENDERED')
+        else:
+            lay.label(text='Game shader: ' + names[shader[:-2] if s.get('transparent') else shader]
+                      + (' + transparent (%s)' % shader if s.get('transparent') else ''), icon='SHADING_RENDERED')
+            row = lay.row(align=True)
+            row.prop(mat, 'pd_transparent', text='Transparent')
+            sub = row.row(align=True)
+            sub.active = mat.pd_transparent
+            sub.prop(mat, 'pd_transparency', text='Transparency', slider=True)
+            if mat.pd_transparent and getattr(context.scene, 'pd_bake_use', False):
+                lay.label(text='Transparent meshes keep vertex light (no light map)', icon='INFO')
+        box = lay.box()
+        box.prop(mat, 'pd_scroll', text='Scrolling Textures', icon='UV_SYNC_SELECT')
+        if mat.pd_scroll:
+            col = box.column(align=True)
+            col.prop(mat, 'pd_scroll_blend', text='Draw')
+            if mat.pd_scroll_blend == 'ALPHA':
+                col.prop(mat, 'pd_transparency', text='Transparency', slider=True)
+            col = box.column(align=True)
+            col.prop(mat, 'pd_scroll_colour', text='Colour X / Y')
+            col.prop(mat, 'pd_scroll_normal_a', text='Normal A X / Y')
+            col.prop(mat, 'pd_scroll_normal_b', text='Normal B X / Y')
+            col.template_ID(mat, 'pd_scroll_normal_b_image', open='image.open')
+            if mat.pd_scroll_normal_b_image is None:
+                col.label(text='Normal B: the normal map again', icon='INFO')
+            box.label(text='150 = slow drift, 600 = moving; press Play to preview', icon='INFO')
+            box.label(text='No light map, reflection or highlight here', icon='INFO')
         draw_preview_toggle(lay, context)
         ob = context.object
         if _uses_light_layer(mat) and ob.data.color_attributes.get(LIGHT_LAYER) is None:

@@ -3,7 +3,8 @@
 Each mesh record becomes an object with its UVs. Meshes using the stage shaders (sd, sbts, sdrefs, sbtsrefs) get a
 PD Stage Shader material with the game's maps, highlight colour and shininess (shine mask = PD_Light alpha);
 other shaders (sky, effects) get a plain PD material with their colour texture. Shadow meshes
-(shaders starting with "sshadow") are skipped. Vertex positions get their node transforms applied, then the
+(shaders starting with "sshadow") are not drawn: the stage's shadow volumes (sshadowch) go to a ShadowCasters
+collection instead. Vertex positions get their node transforms applied, then the
 same game -> Blender conversion as collision, so the model lines up with the imported collision.
 """
 import os
@@ -74,7 +75,23 @@ def _game_material(name, entry, texs, image_of):
     if 1 not in maps and entry['textures'] and entry['textures'][0] is not None and entry['textures'][0] < len(texs):
         maps[1] = image_of(entry['textures'][0])
     b, g, r, power = raw[0x34:0x38]
-    return pd_material.setup(bpy.data.materials.new(name), diffuse=maps.get(1), normal=maps.get(2),
+    mat = bpy.data.materials.new(name)
+    if entry['shader'] == 'sbtscloud3':                # scrolling (the add-on's Scrolling Textures, the sky's
+        # cloud shader): slot 0 colour, 1 and 2 the normal maps, three (x, y) speeds at +0x3C, the blend from +0x15
+        tx = entry['textures']
+        maps = {1: image_of(tx[0])} if tx[0] is not None and tx[0] < len(texs) else {}
+        if tx[1] is not None and tx[1] < len(texs):
+            maps[2] = image_of(tx[1])
+        sp = struct.unpack_from('<6h', raw, 0x3C)
+        mat.pd_scroll = True
+        mat.pd_scroll_colour, mat.pd_scroll_normal_a, mat.pd_scroll_normal_b = sp[0:2], sp[2:4], sp[4:6]
+        if tx[2] is not None and tx[2] != tx[1] and tx[2] < len(texs):
+            mat.pd_scroll_normal_b_image = image_of(tx[2])
+        mat.pd_scroll_blend = 'OPAQUE' if not raw[0x0C] & 0x10 else ('ALPHA' if raw[0x15] == 0x54 else 'ADD')
+        return pd_material.setup(mat, diffuse=maps.get(1), normal=maps.get(2), shine_from_light_alpha=False)
+    if entry['shader'].endswith('al'):                 # the blended variant (st07 glass sdal): see-through
+        mat.pd_transparent = True
+    return pd_material.setup(mat, diffuse=maps.get(1), normal=maps.get(2),
                              reflection=maps.get(4), specular=(_linear(r), _linear(g), _linear(b)),
                              shininess=max(1, min(127, power)) if (r or g or b) else 20,
                              shine_from_light_alpha=True)
@@ -144,11 +161,12 @@ def import_visuals(context, alr_path, parent, scale, roots=(0, 1, 2)):
                 me.color_attributes.active_color = light
                 me.validate()
                 me.update()
-                if mat_entry is not None and shader in ('sd', 'sbts', 'sdrefs', 'sbtsrefs'):
+                if mat_entry is not None and (shader in STAGE_SHADERS or (shader == 'sbtscloud3' and ri != 2)):
                     tex_i = mat_entry['textures'][0]
                     tex_name = texs[tex_i]['name'] if tex_i is not None and tex_i < len(texs) else 'untextured'
+                    extra = bytes(mat_entry['raw'][0x3C:0x48]).hex() if shader == 'sbtscloud3' else ''
                     me.materials.append(_game_material(
-                        '%s_%s_%s_%s' % (stage, shader, tex_name, bytes(mat_entry['raw'][0x34:0x38]).hex()),
+                        '%s_%s_%s_%s%s' % (stage, shader, tex_name, bytes(mat_entry['raw'][0x34:0x38]).hex(), extra),
                         mat_entry, texs, lambda t: _image(b, texs[t], cache, tmpdir)))
                 else:
                     tex_i = mat_entry['textures'][0] if mat_entry else None
@@ -162,10 +180,66 @@ def import_visuals(context, alr_path, parent, scale, roots=(0, 1, 2)):
             report.append('%s: %d meshes, %d triangles' % (coll.name, n_obj, n_tri))
     n_img = sum(1 for v in cache.values() if v is not None)
     report.append('%d textures' % n_img)
+    if 0 in roots and 0 < len(h['roots']):
+        n = import_shadow_casters(b, h, parent, scale, stage)
+        if n:
+            report.append('shadow casters: %d triangles' % n)
     return '; '.join(report)
 
 
-STAGE_SHADERS = ('sd', 'sbts', 'sdrefs', 'sbtsrefs')
+def import_shadow_casters(b, h, parent, scale, stage):
+    """The stage's shadow volumes into a ShadowCasters collection, corners welded, zero-area strips left out:
+    sshadowch (stretched by the game along the sun: the export makes the strips again) as one mesh, sshadowc
+    (already stretched along the map's sun when it was made) as another, marked pd_prestretched so the export
+    writes it back unchanged. Returns the triangle count."""
+    groups = {'sshadowch': ([], {}, [], set()), 'sshadowc': ([], {}, [], set())}
+    for m in alr.meshes(b, h['roots'][0]):
+        entry = m['materials'][m['material']] if m['material'] < len(m['materials']) else None
+        if entry is None or entry['shader'] not in groups or m['vbuf'] >= len(m['vbufs']):
+            continue
+        verts, index, faces, seen = groups[entry['shader']]
+        pos = alr.read_vertices(b, h['resource_offset'], m['vbufs'][m['vbuf']])[0]
+        mtx = alr.node_matrix(m['nodes'], m['node']) if m['node'] < len(m['nodes']) else alr._identity()
+        for t in alr.triangles_from_indices(m['indices'], m['primitive']):
+            f = []
+            for i in t:
+                p = alr.apply(mtx, pos[i])
+                k = tuple(round(c, 3) for c in p)
+                if k not in index:
+                    index[k] = len(verts)
+                    verts.append(cv.to_blender(p, scale))
+                f.append(index[k])
+            if len(set(f)) == 3 and tuple(sorted(f)) not in seen:
+                seen.add(tuple(sorted(f)))
+                faces.append(cv.flip_winding(tuple(f)))
+    total, coll = 0, None
+    for shader, (verts, _index, faces, _seen) in groups.items():
+        if not faces:
+            continue
+        if coll is None:
+            coll = bpy.data.collections.new('ShadowCasters')
+            parent.children.link(coll)
+            coll.pd_role = 'SHADOWS'
+        name = '%s_shadow_casters%s' % (stage, '' if shadow_dynamic(shader) else '_stretched')
+        me = bpy.data.meshes.new(name)
+        me.from_pydata(verts, [], faces)
+        me.validate()
+        me.update()
+        ob = bpy.data.objects.new(name, me)
+        ob.hide_render = True                      # real-time only: kept out of the lighting bake
+        ob.display_type = 'WIRE'
+        if not shadow_dynamic(shader):
+            ob['pd_shadow_stretched'] = True       # already stretched along this map's sun: written back as is
+        coll.objects.link(ob)
+        total += len(faces)
+    return total
+
+
+def shadow_dynamic(shader):
+    return shader == 'sshadowch'
+
+
+STAGE_SHADERS = ('sd', 'sbts', 'sdrefs', 'sbtsrefs', 'sdal', 'sbtsal', 'sdrefsal', 'sbtsrefsal')
 
 
 def build_mesh(name, b, h, texs, records, scale, image_of, stage, transform=None):

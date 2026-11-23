@@ -14,7 +14,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import convert as cv
-from . import exporter, importer, lightbake, pd_material, restricted, scene_tools, sky, surfaces
+from . import characters_ui, exporter, guides, importer, lightbake, pd_material, realtime, restricted, scene_tools, sky, surfaces
 from ._lib import effects_build, objects_build
 from .objects_import import part_kind
 
@@ -124,22 +124,20 @@ class PDSTAGE_OT_export(bpy.types.Operator, ExportHelper):
                               description="Phantom Dust's Assets\\Data folder")
     scale: FloatProperty(name='Scale', description='Blender units per game unit', default=cv.DEFAULT_SCALE, min=0.0001)
     compress_textures: EnumProperty(
-        name='Textures', default='AUTO',
-        items=[('AUTO', 'Fit to budget', 'Uncompressed where it fits: the biggest textures are compressed (DXT1/DXT5) '
-                'until the new textures fit the budget. Too big a model file and the game crashes on load'),
-               ('ALL', 'Compress all', 'Every new texture compressed (DXT1/DXT5) like the game\'s own: a quarter to an '
-                'eighth of the size'),
-               ('NONE', 'Uncompressed', 'Every new texture as plain BGRA: best quality, but a big map can get too '
-                'large for the game to load')])
+        name='Textures', default='ALL',
+        items=[('ALL', 'Compressed', 'Every new texture compressed (DXT1/DXT5) with mip levels, like the game\'s own'),
+               ('NONE', 'Uncompressed', 'Plain BGRA without mip levels (as the game\'s own plain textures): sharper '
+                'up close but shimmers at a distance and takes four to eight times the space. Light maps stay '
+                'compressed')])
     lightmap_budget_mb: IntProperty(
         name='Light map budget (MB)', default=16, min=1, max=256,
         description='How much the baked light maps may take in the model file: the biggest are halved until '
-                    'they fit (light maps are written compressed unless Textures is Uncompressed)')
+                    'they fit')
     texture_budget_mb: IntProperty(
         name='Texture budget (MB)', default=24, min=1, max=256,
-        description='How much the new textures (not the light maps) may take in the model file: Fit to budget '
-                    'compresses the biggest first, and if they still do not fit the biggest are halved. The whole '
-                    'model file must stay under about 50 MB or the game crashes on load')
+        description='How much the new textures (not the light maps) may take in the model file: if they do '
+                    'not fit, the biggest are halved. The game loads at most 20 MiB of model data (vertices and textures): '
+                    'the export also shrinks the biggest textures until the map fits')
     install_to_game: BoolProperty(
         name='Install into the game', default=False,
         description='Also copy the exported files over the game original in the game data folder, so it is playable '
@@ -155,6 +153,7 @@ class PDSTAGE_OT_export(bpy.types.Operator, ExportHelper):
         return super().invoke(context, event)
 
     def execute(self, context):
+        scene_tools.set_broken_parts_hidden(context, True)      # break_ / collider_broken_ / stay_ out of the way
         game_data = bpy.path.abspath(self.game_data or _prefs_game_data(context))
         if not game_data:
             self.report({'ERROR'}, 'Set the game data folder (Assets\\Data) in the export options or add-on preferences')
@@ -232,6 +231,9 @@ class PDSTAGE_PT_collection(bpy.types.Panel):
                     lay.prop(c, 'pd_pieces_hurt')
                 if 'D' in states:
                     lay.prop(c, 'pd_debris_stays')
+                lay.prop(c, 'pd_break_sound')
+                if 'B' in states or 'D' in states:
+                    lay.prop(c, 'pd_piece_sound')
             if c.pd_preset == 'JUMP_PAD':
                 lay.prop(c, 'pd_jump_power')
                 lay.prop(c, 'pd_pad_visible')
@@ -434,7 +436,8 @@ def menu_export(self, context):
 
 classes = (PDSTAGE_Preferences, PDSTAGE_OT_import, PDSTAGE_OT_import_game_original, PDSTAGE_OT_export, PDSTAGE_PT_collection, PDSTAGE_PT_object, PDSTAGE_PT_object_part,
            PDSTAGE_PT_lighting) \
-    + scene_tools.classes + pd_material.classes + sky.classes + lightbake.classes
+    + scene_tools.classes + pd_material.classes + sky.classes + lightbake.classes + characters_ui.classes \
+    + realtime.classes
 
 
 def _colour(name, default, desc, update=None):
@@ -488,6 +491,16 @@ def register():
     bpy.types.Collection.pd_effect = EnumProperty(
         name='Effect', items=EFFECT_ITEMS, default='STEAM_PIPE',
         description='Which of the game\'s effects to place (copied from your game files when exporting)')
+    bpy.types.Collection.pd_break_sound = EnumProperty(
+        name='Break sound', default='KEEP',
+        items=[('KEEP', 'As imported / none', 'An imported object keeps its own; a new one is silent')]
+        + [('%04X' % v, name, desc) for v, name, desc in objects_build.BREAK_SOUNDS],
+        description='The game sound when this object is hit or breaks')
+    bpy.types.Collection.pd_piece_sound = EnumProperty(
+        name='Pieces sound', default='KEEP',
+        items=[('KEEP', 'As imported / none', 'An imported object keeps its own; a new one is silent')]
+        + [('%04X' % v, name, desc) for v, name, desc in objects_build.PIECE_SOUNDS],
+        description='The game sound when its broken pieces hit something')
     bpy.types.Collection.pd_jump_power = bpy.props.IntProperty(
         name='Jump power', default=150, min=1, max=255, description='How high the pad launches players (game: 100-250)')
     bpy.types.Collection.pd_pad_visible = BoolProperty(
@@ -532,8 +545,19 @@ def register():
         update=lambda self, context: pd_material.sync_preview(force=True))
     sky.register_props()
     lightbake.register_props()
+    characters_ui.register_props()
+    realtime.register_props()
     for c in classes:
         _register_class(c)
+    pd_material.register_props()
+    try:
+        guides.register()
+    except Exception as e:                          # a viewport convenience: never block the add-on
+        print('Phantom Dust Stage: scale guides not started:', e)
+    try:
+        scene_tools.register_handlers()
+    except Exception as e:
+        print('Phantom Dust Stage: collider display not started:', e)
     try:
         pd_material.register_preview()
     except Exception as e:                          # the live preview is a convenience: never block the add-on
@@ -548,7 +572,16 @@ def register():
 
 def unregister():
     try:
+        scene_tools.unregister_handlers()
+    except Exception:
+        pass
+    try:
         pd_material.unregister_preview()
+    except Exception:
+        pass
+    pd_material.unregister_props()
+    try:
+        guides.unregister()
     except Exception:
         pass
     for menu, fn in ((bpy.types.TOPBAR_MT_file_export, menu_export), (bpy.types.TOPBAR_MT_file_import, menu_import)):
@@ -562,6 +595,8 @@ def unregister():
         except RuntimeError:
             pass
     sky.unregister_props()
+    characters_ui.unregister_props()
+    realtime.unregister_props()
     for p in lightbake.PROPS:
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)
@@ -577,7 +612,7 @@ def unregister():
 
 SCENE_PROPS = ('pd_char_ambient', 'pd_char_light', 'pd_stage_ambient', 'pd_stage_light', 'pd_sun', 'pd_light_custom',
                'pd_game_preview', 'pd_imported', 'pd_scale', 'pd_game_original')
-COLLECTION_PROPS = ('pd_effect', 'pd_damage', 'pd_hits', 'pd_pieces_hurt', 'pd_pad_visible', 'pd_jump_power', 'pd_debris_stays', 'pd_preset',
+COLLECTION_PROPS = ('pd_break_sound', 'pd_piece_sound', 'pd_effect', 'pd_damage', 'pd_hits', 'pd_pieces_hurt', 'pd_pad_visible', 'pd_jump_power', 'pd_debris_stays', 'pd_preset',
                     'pd_category', 'pd_type',
                     'pd_surface_pick', 'pd_surface', 'pd_collide', 'pd_role')
 OBJECT_PROPS = ('pd_surface_pick', 'pd_surface')

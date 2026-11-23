@@ -254,8 +254,16 @@ def _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats):
         print('Phantom Dust export warning: %s (game type %d-%d) moves by an animation it no longer has; '
               'left out (the game would crash)' % (tc.name, category, typ))
         return None
+    sounds = [0xFFFF] * 8                                  # kept from an imported map, else none
+    src = next((o for o in insts if o.get('pd_object_sounds')), None)
+    if src is not None:
+        sounds = [int(x) for x in src['pd_object_sounds']][:8] + [0xFFFF] * 8
+    for k, prop in ((1, 'pd_break_sound'), (2, 'pd_piece_sound')):
+        choice = getattr(tc, prop, 'KEEP')
+        if choice != 'KEEP':
+            sounds[k] = int(choice, 16)
     return dict(name=name, models=models, collision=collision, collisions=collisions, effects=effects, anims=anims,
-                category=category, type=typ, placements=placements, preset=preset)
+                sounds=sounds, category=category, type=typ, placements=placements, preset=preset)
 
 
 def _mass_box(meshes, ob):
@@ -295,7 +303,8 @@ def add_to_files(types, alr_add_models, alr_added_roots):
                 k += 1
         idx = len(objects)
         objects.append(dict(name=t['name'][:31], roots=tuple(roots), collision=t['collision'],
-                            collisions=t.get('collisions'), effects=t.get('effects'), anims=t.get('anims')))
+                            collisions=t.get('collisions'), effects=t.get('effects'), anims=t.get('anims'),
+                            sounds=t.get('sounds')))
         for p in t['placements']:
             placements.append(dict(object=idx, category=t['category'], type=t['type'], pos=p['pos'], rot=p['rot'],
                                    extra=p.get('extra', (0, 0))))

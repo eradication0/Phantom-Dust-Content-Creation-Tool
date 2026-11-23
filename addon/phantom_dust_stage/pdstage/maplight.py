@@ -158,6 +158,17 @@ def set_light(script, light_set, direction, diffuse, ambient, diffuse2=None, axi
     _replace(script, SET_LIGHT, light_set, 9, args)
 
 
+def set_point(script, light_set, slot, rng, pos, colour):
+    """Set one point-light slot (0-2) of a light set: rng = brightness (light = colour x rng / distance^2,
+    0 = off), pos in game units. Adds the call if the script has none for that slot."""
+    args = [_f(rng)] + [_f(x) for x in pos] + [_c(colour), ('i', slot), ('i', light_set)]
+    for i, (c, a) in enumerate(script['calls']):
+        if c == SET_POINT and len(a) == 7 and a[5] == ('i', slot) and a[6] == ('i', light_set):
+            script['calls'][i] = (SET_POINT, args)
+            return
+    script['calls'].append((SET_POINT, args))
+
+
 def _replace(script, cid, light_set, set_arg, args):
     for i, (c, a) in enumerate(script['calls']):
         if c == cid and len(a) > set_arg and a[set_arg] == ('i', light_set):
