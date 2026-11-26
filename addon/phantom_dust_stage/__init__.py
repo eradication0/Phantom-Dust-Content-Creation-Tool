@@ -89,6 +89,10 @@ class PDSTAGE_OT_import_game_original(bpy.types.Operator):
     bl_property = 'map'
 
     map: EnumProperty(name='Map', items=IMPORT_ITEMS)
+    preserve: BoolProperty(
+        name='Record for preserving unedited parts', default=False,
+        description='Also record what the import made, for the export fallback "Preserve unedited parts from the '
+                    'original file". Off: the scene holds only what it shows')
 
     def execute(self, context):
         stage, _sep, variant = self.map.partition(':')
@@ -103,7 +107,7 @@ class PDSTAGE_OT_import_game_original(bpy.types.Operator):
             return {'CANCELLED'}
         try:
             _root, msg = importer.import_stage(context, dat_path, alr_path=alr_path, stage=stage,
-                                               variant=2 if variant == 'v2' else 0)
+                                               variant=2 if variant == 'v2' else 0, preserve=self.preserve)
         except Exception as e:
             self.report({'ERROR'}, 'Import failed: %s' % e)
             return {'CANCELLED'}
@@ -138,6 +142,11 @@ class PDSTAGE_OT_export(bpy.types.Operator, ExportHelper):
         description='How much the new textures (not the light maps) may take in the model file: if they do '
                     'not fit, the biggest are halved. The game loads at most 20 MiB of model data (vertices and textures): '
                     'the export also shrinks the biggest textures until the map fits')
+    preserve_unedited: BoolProperty(
+        name='Preserve unedited parts from the original file', default=False,
+        description='Fallback, off by default: parts the scene did not change since it was imported with "Record '
+                    'for preserving unedited parts" keep the original file\'s bytes, and simple edits are written '
+                    'into the original records. Off: both files are built from what is in the scene')
     install_to_game: BoolProperty(
         name='Install into the game', default=False,
         description='Also copy the exported files over the game original in the game data folder, so it is playable '
@@ -162,6 +171,8 @@ class PDSTAGE_OT_export(bpy.types.Operator, ExportHelper):
         if os.path.normcase(os.path.dirname(os.path.abspath(self.filepath))) == game_map:
             self.report({'ERROR'}, 'Export to another folder; tick "Install into the game" to put the map in the game')
             return {'CANCELLED'}
+        from . import roundtrip
+        roundtrip.ENABLED = self.preserve_unedited
         try:
             base_alr = exporter.game_original_alr(game_data, self.game_original)
             out_alr = os.path.splitext(self.filepath)[0] + '.alr'

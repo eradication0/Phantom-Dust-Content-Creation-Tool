@@ -24,6 +24,43 @@ PORTABLE_KINDS = (2, 22, 24)          # smoke, steam / smoke / fire, sparks: wor
 MODEL_KINDS = (10, 13, 14, 15)        # effect models: u16 at 0x28 = their slot in the map's MD00 models list
 
 
+def _same_entry(a, b, tol=1e-3):
+    """Two effect entries equal up to float rounding: position (+0x04) and scale (+0x1C) within `tol`, the turn
+    (+0x10) as angles, every other byte equal."""
+    if len(a) != len(b) or a[:4] != b[:4] or a[0x28:] != b[0x28:]:
+        return False
+    fa, fb = struct.unpack_from('<9f', a, 4), struct.unpack_from('<9f', b, 4)
+    for k in range(9):
+        d = fa[k] - fb[k]
+        if 3 <= k < 6:                                  # rx, ry, rz
+            d = cv.wrap(d)
+        if not abs(d) <= tol:
+            return False
+    return True
+
+
+def in_game_order(entries, game):
+    """Fallback only ("Preserve unedited parts"): the effect entries built from the scene laid over the base file's
+    own table `game` (raw entries). Each built entry equal to a game entry up to float rounding (_same_entry) keeps
+    that game entry's bytes and place; the others (moved, turned, scaled, re-set) go into the places of the game
+    entries nothing matched, in order. None when the counts differ (effects added or deleted: the table is
+    written as built)."""
+    if len(entries) != len(game):
+        return None
+    free = list(range(len(game)))
+    out, rest = [None] * len(game), []
+    for e in entries:
+        k = next((k for k in free if _same_entry(e, game[k])), None)
+        if k is None:
+            rest.append(e)
+        else:
+            free.remove(k)
+            out[k] = game[k]
+    for k, e in zip(free, rest):
+        out[k] = e
+    return out
+
+
 def _imported_entries(scene):
     """(empty, raw entry, home map) of every imported effect in the scene's Effects collections."""
     from .exporter import collections_with_role
@@ -32,8 +69,14 @@ def _imported_entries(scene):
             if getattr(tc, 'pd_effect', '') != 'GAME':
                 continue
             for ob in tc.objects:
-                if 'pd_effect_raw' in ob:
-                    yield ob, bytes.fromhex(ob['pd_effect_raw']), ob.get('pd_effect_map', '')
+                if 'pd_fx_class' in ob:
+                    from .objects_import import effect_record
+                    yield ob, effect_record(ob, scene.pd_scale), ob.get('pd_effect_map', '')
+
+
+# the slot being exported (set by the exporter): an effect whose home map is this slot is in its own map (the town
+# st09 is not in the export's map list, so the scene's game-original setting cannot name it)
+EXPORT_SLOT = None
 
 
 def foreign_models(scene, game_data, base_texture_count, new_textures):
@@ -43,7 +86,7 @@ def foreign_models(scene, game_data, base_texture_count, new_textures):
     keys [(home, slot)] in the same order, md00 names {key: name}). New textures are appended to new_textures."""
     from .exporter import original_path
     from ._lib import alr, alr_build, dat
-    target = scene.pd_game_original
+    target = EXPORT_SLOT or scene.pd_game_original
     wanted = []
     for _ob, raw, home in _imported_entries(scene):
         if raw[0] in MODEL_KINDS and home and home != target:
@@ -105,11 +148,12 @@ def gather(context, eff_colls, scale, game_data, carried=None):
         for tc in ec.children:
             preset = getattr(tc, 'pd_effect', 'STEAM_PIPE')
             if preset == 'GAME':                          # imported: each empty keeps the game's own entry
-                target = context.scene.pd_game_original
+                target = EXPORT_SLOT or context.scene.pd_game_original
                 for ob in tc.objects:
-                    if 'pd_effect_raw' not in ob:
+                    if 'pd_fx_class' not in ob:
                         continue
-                    raw = bytearray(bytes.fromhex(ob['pd_effect_raw']))
+                    from .objects_import import effect_record
+                    raw = bytearray(effect_record(ob, scale))     # every field from the empty
                     home = ob.get('pd_effect_map', '')
                     key = (home, struct.unpack_from('<H', raw, 0x28)[0]) if raw[0] in MODEL_KINDS else None
                     if key is not None and home != target and carried and key in carried:
@@ -119,15 +163,7 @@ def gather(context, eff_colls, scale, game_data, carried=None):
                         # they read past its lists and the game crashes on load
                         skipped[home or '?'] = skipped.get(home or '?', 0) + 1
                         continue
-                    mw = ob.matrix_world
-                    rx, _ry, rz = struct.unpack_from('<3f', raw, 0x10)
-                    struct.pack_into('<3f', raw, 0x10, rx, 0.0, rz)        # its turn comes from the empty
-                    base_scale = struct.unpack_from('<3f', raw, 0x1C)
-                    s = mw.to_scale()
-                    mult = (s.x, s.z, s.y)
-                    entries.append(effects_build.place(bytes(raw), cv.to_game(mw.translation, scale),
-                                                       yaw=cv.yaw_to_game(mw.to_euler('XYZ').z),
-                                                       scale=tuple(base_scale[k] * mult[k] for k in range(3))))
+                    entries.append(bytes(raw))
                     counts['imported'] = counts.get('imported', 0) + 1
                 continue
             source_map, index = effects_build.PRESETS[preset][:2]

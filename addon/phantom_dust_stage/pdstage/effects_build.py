@@ -69,3 +69,25 @@ def set_effects(b, entries):
     struct.pack_into('<I', buf, dat.H_EF00, off)
     struct.pack_into('<I', buf, dat.H_FILE_SIZE, len(buf))
     return bytes(buf)
+
+
+# ---------------------------------------------------------------- a record as named fields (and back)
+# Record (clean-room notes on the stage effect list, docs "dat_stage" effect_record, and the effect-class table):
+#   +0x00 u8 class (the effect object factory), +0x01 u8 when it plays (0 while the variant shows, 1 hit, 2 break,
+#   3 other; in the town area + 6), +0x02 u8 id (0xFF always), +0x03 u8 mode (draw mode of classes 10 / 13, start
+#   tick of shakes), +0x04 f32[3] position, +0x10 f32[3] rotation (radians, Rz Ry Rx), +0x1C f32[3] scale,
+#   +0x28 u8[12] class parameters, +0x34 f32[10] class values.
+
+def fields(raw):
+    """dict of the record's fields."""
+    return dict(cls=raw[0], when=raw[1], id=raw[2], mode=raw[3], pos=struct.unpack_from('<3f', raw, 4),
+                rot=struct.unpack_from('<3f', raw, 0x10), scale=struct.unpack_from('<3f', raw, 0x1C),
+                params=list(raw[0x28:0x34]), values=list(struct.unpack_from('<10f', raw, 0x34)))
+
+
+def record(cls, when, id, mode, pos, rot, scale, params, values):
+    """A 0x5C-byte record from its fields."""
+    params = [max(0, min(255, int(x))) for x in list(params)[:12]] + [0] * max(0, 12 - len(params))
+    values = [float(x) for x in list(values)[:10]] + [0.0] * max(0, 10 - len(values))
+    return struct.pack('<4B3f3f3f12B10f', int(cls) & 0xFF, int(when) & 0xFF, int(id) & 0xFF, int(mode) & 0xFF,
+                       *pos, *rot, *scale, *params, *values)

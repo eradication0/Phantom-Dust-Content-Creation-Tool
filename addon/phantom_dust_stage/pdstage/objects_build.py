@@ -22,7 +22,7 @@ confirmed in game for collision), so nothing else in the file moves.
 import struct
 
 from . import dat
-from .collision_build import build_block
+from .collision_build import build_block, OBJECT_GRID
 
 NONE = 0xFFFFFFFF
 
@@ -162,7 +162,7 @@ def add_objects(b, objects, placements):
         offs = []
         for tris in cols[:3]:
             if tris:
-                block, _ = build_block(tris)
+                block, _ = build_block(tris, grid=OBJECT_GRID)
                 offs.append(len(buf))
                 buf += block
                 buf += b'\0' * (-len(buf) % 4)
@@ -209,20 +209,27 @@ def add_objects(b, objects, placements):
         snd += [0xFFFF] * (8 - len(snd))
         buf += struct.pack('<8H', *[int(x) & 0xFFFF for x in snd])
 
-    # one placement table, used by every layout (slot 0 is the fallback for all of them)
-    buf += b'PS00'
-    ps_off = len(buf)
+    # one placement list per slot the placements name (slot 0: the default list, used by a variant without its own
+    # list 1 + variant); a placement without slots is in list 0
+    lists = {}
     for p in placements:
-        e6, e7 = p.get('extra', (0, 0))
-        buf += struct.pack('<i4BI3f3f', p['object'], p['category'], p['type'], e6, e7, 0, *p['pos'], *p['rot'])
+        for slot in p.get('slots') or (0,):
+            lists.setdefault(int(slot), []).append(p)
+    ps = {}
+    for slot in sorted(lists):
+        buf += b'PS0/' if slot == 0 else b'PS0%d' % (slot - 1)     # the game's tags: PS0/, PS01 (slot 2), PS02
+        ps[slot] = len(buf)
+        for p in lists[slot]:
+            e6, e7 = p.get('extra', (0, 0))
+            buf += struct.pack('<i4BI3f3f', p['object'], p['category'], p['type'], e6, e7, 0, *p['pos'], *p['rot'])
 
     struct.pack_into('<I', buf, dat.H_NAMES, names_off)
     struct.pack_into('<I', buf, dat.H_OBJECT_COUNT, len(objects))
     struct.pack_into('<I', buf, dat.H_OBJECTS, ob_off)
     struct.pack_into('<I', buf, dat.H_OBJECT_SOUNDS, snd_off)
     for slot in range(11):
-        struct.pack_into('<I', buf, dat.H_LAYOUT_SLOTS + 4 * slot, ps_off if slot == 0 else NONE)
-        struct.pack_into('<I', buf, dat.H_LAYOUT_COUNTS + 4 * slot, len(placements) if slot == 0 else NONE)
+        struct.pack_into('<I', buf, dat.H_LAYOUT_SLOTS + 4 * slot, ps.get(slot, NONE))
+        struct.pack_into('<I', buf, dat.H_LAYOUT_COUNTS + 4 * slot, len(lists[slot]) if slot in ps else NONE)
     struct.pack_into('<I', buf, dat.H_FILE_SIZE, len(buf))
     return bytes(buf)
 
@@ -241,5 +248,5 @@ def read_objects(b):
         for i in range(cnt):
             oid, cat, typ, e6, e7, _pad, *rest = struct.unpack_from('<i4BI3f3f', b, off + i * 0x24)
             places.append(dict(slot=slot, object=oid, category=cat, type=typ, extra=(e6, e7),
-                               pos=tuple(rest[:3]), rot=tuple(rest[3:])))
+                               pos=tuple(rest[:3]), rot=tuple(rest[3:]), offset=off + i * 0x24))
     return names, table, places

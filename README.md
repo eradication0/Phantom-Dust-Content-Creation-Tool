@@ -155,14 +155,25 @@ a tint. Off: the game original's lighting is kept.
 - **Clean slate** (on for new maps): removes the game original's own props and effects.
 - **Replace background and sky**, **Character shadows** (on).
 - **Install into the game**: copies the result over the map in the game data folder, after backing up the
-  game's files once into `Map\pd_addon_backup`. Exports always start from the game's own files (the backup),
-  never from a map installed earlier. Without it, copy `stNN.dat` and `stNN.alr` over the game's yourself.
+  game's files once into `Map\pd_addon_backup`. Exports start from the game's own files (the backup), never
+  from a map installed earlier, except for a scene imported from a map file of the same slot (an earlier
+  export): that one is exported on top of the file it came from, so what you did not edit since stays as it is
+  and an edit you take back gives that file back. Without it, copy `stNN.dat` and `stNN.alr` over the game's
+  yourself.
 
 Everyone in an online match should have the same map installed.
 
 **Editing an existing map** (secondary): **Import Game Original...** loads a map's collision, spawns and (with
 **Visible model**) its stage, background and sky with textures. Edit and export back to the same slot; Clean
-slate is off for imported maps so their objects stay.
+slate is off for imported maps so their objects stay. What you did not edit is written exactly as the game has it:
+exported unchanged, a map gives back the game's own two files byte for byte; a moved spawn, object or effect
+changes only its own entry; moved collision is written into the map's own collision records (only the moved
+triangles and their vertices change); a stage or background mesh whose vertices you only moved is written into
+its own vertices (it keeps its game shader and material); added copies of placed objects and deleted ones change
+only the placement list; custom lighting changes only the light script's colour and direction words; an edited
+stage keeps every game mesh you did not touch. Taking an edit back (in the same scene, or after importing the
+exported files again) gives the game's files back, but for float rounding in a few moved values. (The import
+remembers the map in the scene, so this also works after saving and reopening the .blend.)
 
 ## For developers
 
@@ -177,6 +188,7 @@ python tools/dump_alr.py      Map/st04.alr --root 0       models and textures
 python tools/dump_ssb.py      Map/st04.dat                the map's lighting script
 python tools/test_patch.py    ...                         the in-game test edits (writes a new file)
 python tools/dump_cso.py      <game>/SD_vs.cso            a game shader's constants and code
+python tools/check_stage.py   orig.dat orig.alr new.dat new.alr   independent structure check of an export
 ```
 
 Tests (Blender without a window, or plain Python):
@@ -186,6 +198,8 @@ blender -b --factory-startup --python tests/blender_workflow.py  -- <Assets/Data
 blender -b --factory-startup --python tests/blender_roundtrip.py -- <Assets/Data folder> <out_dir>
 blender -b --factory-startup --python tests/blender_visuals.py   -- <Assets/Data folder> <out_dir>
 blender -b --factory-startup --python tests/blender_material.py  -- <Assets/Data folder> <out_dir>
+blender -b --factory-startup --python tests/blender_roundtrip_all.py -- <Assets/Data folder> <out_dir> [stNN ...]
+python tests/collision_patch_test.py <Assets/Data/Map folder> [stNN ...]
 python tests/alr_rebuild.py   <Assets/Data/Map folder>
 python tests/maplight_test.py <Assets/Data/Map folder>
 python tests/objects_test.py  <map.dat> <map.alr> <out_dir>

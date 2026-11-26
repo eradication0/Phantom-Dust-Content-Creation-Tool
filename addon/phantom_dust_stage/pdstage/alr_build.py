@@ -29,10 +29,19 @@ FORMAT = 0x01
 VERTEX_SIZE = 0x18
 BUMP_FORMAT = 0x03
 BUMP_VERTEX_SIZE = 0x20
-# Xbox-era attribute mask stored in vertex-buffer entries (+0x04): position, normal, UV, colour (+ tangent, binormal)
 LM_FORMAT = 0x1F
 LM_VERTEX_SIZE = 0x20
-VERTEX_MASK = {FORMAT: 0x00CF, BUMP_FORMAT: 0x30CF, 0x09: 0x00C7, 0x0B: 0x0087, LM_FORMAT: 0x0010304F}
+# Attribute mask stored in vertex-buffer entries (+0x04) for each vertex format the game uses: every buffer of a
+# format has the same stride and mask in all of the game's .alr files (Xbox and 2017 PC; surveyed by the Phantom
+# Rust project, docs/formats/alr.md "Vertex attributes"). Bits 0-2 position (12 bytes), every other set bit 4 bytes.
+# A buffer must carry its own format's mask: copying the sd template's 0xCF onto a 16-byte format-0x07 shadow
+# box (or a 12-byte 0x10 shadow volume) says 24 bytes per vertex.
+FORMAT_LAYOUTS = {0x01: (24, 0xCF), 0x03: (32, 0x30CF), 0x05: (28, 0x64F), 0x07: (16, 0xF), 0x08: (20, 0x8F),
+                  0x09: (20, 0xC7), 0x0B: (16, 0x87), 0x10: (12, 0x7), 0x11: (24, 0x647), 0x15: (24, 0x1000C7),
+                  0x16: (28, 0x3000C7), 0x17: (32, 0x7000C7), 0x18: (16, 0x47), 0x1A: (40, 0x78000CF),
+                  0x1D: (36, 0x1030CF), 0x1E: (28, 0x100CF), 0x1F: (32, 0x10304F), 0x21: (32, 0x3000CF),
+                  0x25: (28, 0x304F)}
+VERTEX_MASK = {f: mask for f, (_stride, mask) in FORMAT_LAYOUTS.items()}
 # the hub's (st09_01) lbts material entry: slots diffuse, light map, normal map; roles 0x0261
 LBTS_TEMPLATE = ('40c1398800000000000000002d0000001f102600001161021c00230013000000000000000000000000000000000000000000'
                  '00ff7f7f7f140000000000000000000000000000000000000000')
@@ -83,7 +92,7 @@ SCROLL_TEMPLATE = ('5e43f3b200355f9d000000003d04000003100200001421040f0010001000
 SCROLL_BLEND = {'OPAQUE': (0x00, 0x11), 'ALPHA': (0x10, 0x54), 'ADD': (0x10, 0x14)}   # +0x0C flag, +0x15 factors
 
 
-def scroll_record(index, diffuse, normal_a, normal_b, speeds=(0, 0, 0, 0, 0, 0), blend='OPAQUE'):
+def scroll_record(index, diffuse, normal_a, normal_b, speeds=(0, 0, 0, 0, 0, 0), blend='OPAQUE', specular=None):
     """A scrolling material entry (shader sbtscloud3). speeds: (x, y) for the colour texture, normal map A and
     normal map B. blend: 'OPAQUE', 'ALPHA' (see-through by alpha) or 'ADD' (glow added on top, as the clouds)."""
     raw = bytearray(bytes.fromhex(SCROLL_TEMPLATE))
@@ -93,7 +102,71 @@ def scroll_record(index, diffuse, normal_a, normal_b, speeds=(0, 0, 0, 0, 0, 0),
     raw[0x12] = index & 0xFF
     struct.pack_into('<4H', raw, 0x18, diffuse, normal_a, normal_b, diffuse)
     struct.pack_into('<6h', raw, 0x3C, *(int(max(-32768, min(32767, round(v)))) for v in speeds))
+    if specular is not None:                          # (r, g, b, power): the game's cloud material's own (+0x34 B, G, R, power)
+        raw[0x34:0x38] = bytes((specular[2], specular[1], specular[0], specular[3]))
     return bytes(raw)
+
+
+# The vertex format each game shader draws (every material of the game's .alr files with that shader has it, and so
+# has its vertex buffer: a survey of all stage and object models of the 2017 PC files). Only the formats whose
+# attributes are a subset of 0x30CF (position, normal, UV, colour, tangent frame) are listed: the writer makes those
+# from a Blender mesh. Shaders of other formats (shadows, sbtscloud3's own path, scrash2, swd, the vk effect shaders)
+# are not written from game settings.
+SHADER_FORMAT = {
+    'sd': 0x01, 'sdal': 0x01, 'sdyfog': 0x01, 'sdlyfog': 0x01, 'sdrefs': 0x01, 'sdrefp': 0x01, 'sbpx': 0x01,
+    'sbpxrefpal': 0x01, 'sbpxrefsal': 0x01, 'sbos': 0x01, 'isyogore': 0x01, 'vklight': 0x01,
+    'sbts': 0x03, 'sbtsyfog': 0x03, 'sbtsrefs': 0x03, 'sbtsrefp': 0x03, 'dbtsvc': 0x03, 'vkblink2': 0x03,
+    'vkwater': 0x03, 'dbtsrefsvc': 0x03, 'vkcap02': 0x03,
+    'sv': 0x08, 'sc': 0x09, 'scal': 0x09, 'vkblink': 0x09, 'vkraylight': 0x09, 'vksand': 0x09,
+    'vkcapm2a': 0x09, 'vkendofwld': 0x09,
+    # object shadow volumes (an object model's own sshadow / sshadowch / sshadowc meshes: drawn by the stencil
+    # shadow pass, gone with the intact model when the object breaks): position + normal, sshadowc position only
+    'sshadow': 0x07, 'sshadowch': 0x07, 'sshadowc': 0x10,
+    'svc': 0x0B, 'svcal': 0x0B, 'dbts': 0x25, 'dbtsrefs': 0x25, 'dbtsal': 0x25, 'dbtsrefsal': 0x25,
+}
+
+
+def game_record(index, game, textures, specular):
+    """One 0x4C-byte material entry from a material's game settings (clean-room notes on the ALR format, "Materials"):
+    +0x00 shader name (base 40), +0x0C flags, +0x10 vertex format (the shader's), +0x11 filter, +0x12 index,
+    +0x14 blend, +0x16 texture-stage roles, +0x18 four texture indices (0xFFFF none), +0x30 colour word, +0x34
+    specular (blue, green, red, power), +0x38 word, +0x3C eight shader parameters (s16; their meaning depends on the
+    shader class). The runtime words (+0x08, +0x20..+0x2F) are zero on disc."""
+    raw = bytearray(0x4C)
+    struct.pack_into('<2I', raw, 0, *encode_text(game['shader']))
+    struct.pack_into('<I', raw, 0x0C, int(game['flags']) & 0xFFFFFFFF)
+    raw[0x10] = SHADER_FORMAT.get(game['shader'], LM_FORMAT if game['shader'].startswith('lbts') else 0)
+    raw[0x11] = int(game['filter']) & 0xFF
+    raw[0x12] = index & 0xFF
+    struct.pack_into('<HH', raw, 0x14, int(game['blend']) & 0xFFFF, int(game['roles']) & 0xFFFF)
+    tex = [0xFFFF if t is None else t for t in (list(textures) + [None] * 4)[:4]]
+    struct.pack_into('<4H', raw, 0x18, *tex)
+    r, g, b, power = (int(max(0, min(255, round(x)))) for x in specular)
+    struct.pack_into('<I4BI', raw, 0x30, int(game['colour']) & 0xFFFFFFFF, b, g, r, power,
+                     int(game['word_38']) & 0xFFFFFFFF)
+    struct.pack_into('<8h', raw, 0x3C, *(int(max(-32768, min(32767, v))) for v in (list(game['params']) + [0] * 8)[:8]))
+    return bytes(raw)
+
+
+def pack_vertex(fmt, vert):
+    """One vertex in a format whose attributes are a subset of 0x30CF: (pos, normal, uv, (r, g, b, a)[, tangent,
+    binormal])."""
+    mask = VERTEX_MASK[fmt]
+    pos, nrm, uv = vert[:3]
+    out = struct.pack('<3f', *pos)
+    if mask & 0x08:
+        out += struct.pack('<I', pack_normal(nrm))
+    if mask & 0x40:
+        u, v = (max(-32768, min(32767, int(round(x * UV_DIV)))) for x in uv)
+        out += struct.pack('<hh', u, v)
+    if mask & 0x80:
+        col = vert[3] if len(vert) > 3 and vert[3] is not None else (255, 255, 255, 255)
+        out += struct.pack('<4B', col[2], col[1], col[0], col[3])
+    if mask & 0x1000:
+        out += struct.pack('<I', pack_normal(vert[4] if len(vert) > 4 else (1.0, 0.0, 0.0)))
+    if mask & 0x2000:
+        out += struct.pack('<I', pack_normal(vert[5] if len(vert) > 5 else (0.0, 1.0, 0.0)))
+    return out
 
 
 def material_record(kind, index, diffuse, normal=None, reflection=None, specular=(0, 0, 0, 0), transparent=False):
@@ -174,33 +247,19 @@ def _pad(data, align):
 # ---------------------------------------------------------------- templates from the base file
 
 def _templates(b):
-    """Raw records of an existing format-0x01 "sd" mesh to copy unknown fields from."""
+    """The records new meshes are written with, and the base file's shadow material and plain-texture entry."""
     h = alr.header(b)
-    found = None
-    prim5_unk = None
-    for r in h['roots']:
-        mats = vbs = None
-        mat_hdr = None
-        for off, t, size in alr.chain(b, r):
-            if t == 0x01:
-                mats = alr._materials(b, off)
-                mat_hdr = b[off:off + 12]
-            elif t == 0x16:
-                vbs = (off, alr._vertex_buffers(b, off))
-            elif t == 0x02 and mats and vbs:
-                mat_i, _node, vb_i, prim = struct.unpack_from('<4H', b, off + 0x40)
-                if prim == 5 and prim5_unk is None:
-                    prim5_unk = b[off + 0x30:off + 0x40]
-                if found is None and mat_i < len(mats) and vb_i < len(vbs[1]):
-                    m = mats[mat_i]
-                    if m['shader'] == 'sd' and m['vertex_format'] == FORMAT and vbs[1][vb_i]['format'] == FORMAT:
-                        found = dict(material=bytearray(m['raw']), material_hdr=bytes(mat_hdr),
-                                     vbuf=bytearray(b[vbs[0] + 0xC + vb_i * 0x1C:vbs[0] + 0xC + (vb_i + 1) * 0x1C]),
-                                     mesh=bytearray(b[off:off + 0x68]), mesh_prim=prim)
-    if found is None:
-        raise ValueError('base .alr has no "sd" format-0x01 mesh to copy settings from')
-    if prim5_unk is not None:
-        found['mesh'][0x30:0x40] = prim5_unk          # fields that go with triangle-list meshes
+    # The records are written from their documented fields (clean-room notes on the ALR format), not copied from a
+    # mesh of the base file (1.3.0 did, and failed on the town, which has no "sd" mesh):
+    #   vertex buffer entry: format, stride, stride, 8, mask, count, 0 (runtime), 1, data offset, 0 (runtime);
+    #   draw: sphere, box, the draw's light list (count and run-time light numbers; the town's area models use them),
+    #   material, joint, buffer, primitive, vertex start / count, index count, five runtime words 0;
+    #   material chunk: count and 0x41 (1301 of the game's 1784 material chunks; the others hold 0).
+    found = dict(material=bytearray(bytes.fromhex(MATERIAL_TEMPLATES['sd'])),
+                 material_hdr=struct.pack('<IIHH', 0x01, 12, 0, 0x41),
+                 vbuf=bytearray(struct.pack('<4B6I', FORMAT, VERTEX_SIZE, VERTEX_SIZE, 8, VERTEX_MASK[FORMAT], 0, 0,
+                                            1, 0, 0)),
+                 mesh=bytearray(struct.pack('<II', 0x02, 0x68) + bytes(0x60)), mesh_prim=5)
     # The stage's shadow mesh (shader sshadowch, vertex format 0x07): without it characters cast no shadow.
     # Most maps have sshadowc instead (vertex format 0x10, position only): volumes already stretched along the
     # map's sun when it was made; the shadow casters are written that way there (shadow_meshes).
@@ -236,12 +295,14 @@ def _empty_chain(b):
 
 # ---------------------------------------------------------------- building a model
 
-def texture_record(tpl, name, width, height, mips, rel_offset, fmt=TEX_FORMAT):
-    """fmt: TEX_FORMAT (plain BGRA), 0x0C DXT1 or 0x0F DXT5 (pdstage/dxt.py), as the game's own textures."""
+def texture_record(tpl, name, width, height, mips, rel_offset, fmt=TEX_FORMAT, cube=False):
+    """fmt: TEX_FORMAT (plain BGRA), 0x0C DXT1 or 0x0F DXT5 (pdstage/dxt.py), as the game's own textures.
+    cube: the descriptor's cube bit (format register bit 2): six faces follow one another, 128-byte aligned."""
     e = bytearray(tpl)
     wp, hp = width.bit_length() - 1, height.bit_length() - 1
     struct.pack_into('<I', e, 0x04, rel_offset)
-    struct.pack_into('<4B', e, 0x0C, e[0x0C], fmt, (wp << 4) | (mips & 0xF), hp & 0xF)
+    flags = (e[0x0C] | 4) if cube else (e[0x0C] & ~4)
+    struct.pack_into('<4B', e, 0x0C, flags, fmt, (wp << 4) | (mips & 0xF), hp & 0xF)
     struct.pack_into('<I', e, 0x10, 0)
     struct.pack_into('<2I', e, 0x14, *encode_text(name))
     return bytes(e)
@@ -317,7 +378,7 @@ def _shadow_volume_c(tpl, meshes):
         for t in m['tris']:
             f = []
             for i in t:
-                k = tuple(round(c, 3) for c in m['verts'][i][0])
+                k = tuple(round(c, 4) for c in m['verts'][i][0])
                 if k not in pidx:
                     pidx[k] = len(pv)
                     pv.append((k, 0))
@@ -345,7 +406,15 @@ def shadow_meshes(tpl, meshes, mode='minimal'):
     sshadowc, as sshadowch with the zero-area strips on every edge (the game then stretches it a little more).
     Returns raw mesh dicts for build_model (empty if the game original has no shadow material)."""
     if mode == 'full' and tpl.get('shadow_c'):
-        return _shadow_volume_c(tpl, meshes)
+        # casters already stretched along the sun (the game's sshadowc volumes) are written as they are; casters
+        # the game stretches itself while drawing (its sshadowch meshes: 'stretched' False) stay sshadowch. Written
+        # all as sshadowc, Spiral Highway's character-shadow mesh became a fixed volume: a dark wedge over the road
+        fixed = [m for m in meshes if m.get('stretched', True)]
+        moving = [m for m in meshes if not m.get('stretched', True)]
+        out = _shadow_volume_c(tpl, fixed)
+        if not moving or not tpl.get('shadow'):
+            return out
+        return out + shadow_meshes(dict(tpl, shadow_c=None), moving, 'full')
     if not tpl.get('shadow'):
         return []
     index, verts, tris = {}, [], []
@@ -457,33 +526,53 @@ def build_model(tpl, meshes, texture_base_index, rb_base, nodes=None, material_u
                 for slot, ref in over:                    # e.g. a new cloud texture in slot 0
                     struct.pack_into('<H', raw, 0x18 + 2 * slot, absolute(ref))
                 materials.append(bytes(raw))
-            parts.append((mat_index[key], r, r['tris'], m.get('node', 0), False))
+            parts.append((mat_index[key], r, r['tris'], m.get('node', 0), False, tuple(m.get('lights', ()))))
             continue
         if 'material' in m and m['material'].get('lightmap') is not None:   # light-mapped (lbts)
             md = m['material']
             d, lm, n = absolute(md['diffuse']), absolute(md['lightmap']), absolute(md['normal'])
             spec = tuple(md.get('specular', (0, 0, 0, 0)))
-            key = ('lbts', d, lm, n, spec)
+            g = md.get('game')                             # the game's own lbts / lbtsrefs settings, if any
+            tex = tuple(absolute(t) for t in md['textures']) if g else None
+            key = ('lbts', d, lm, n, spec, tuple(sorted(g.items())) if g else None, tex)
             if key not in mat_index:
                 mat_index[key] = len(materials)
-                materials.append(lbts_record(len(materials), d, lm, n, spec))
+                materials.append(game_record(len(materials), g, tex, spec) if g else
+                                 lbts_record(len(materials), d, lm, n, spec))
             if any(len(v) < 7 for v in m['verts']):
                 raise ValueError('a light-mapped mesh needs tangent, binormal and a second UV on every vertex')
             for verts, tris in split_mesh(m['verts'], m['tris']):
-                parts.append((mat_index[key], verts, tris, m.get('node', 0), 'lm'))
+                parts.append((mat_index[key], verts, tris, m.get('node', 0), 'lm', tuple(m.get('lights', ()))))
             continue
         if 'material' in m and m['material'].get('scroll') is not None:     # scrolling (sbtscloud3)
             md = m['material']
             sc = md['scroll']
             d, na, nb = absolute(md['diffuse']), absolute(sc['normal_a']), absolute(sc['normal_b'])
-            key = ('scroll', d, na, nb, tuple(sc['speeds']), sc.get('blend', 'OPAQUE'))
+            spec = tuple(sc['specular']) if sc.get('specular') is not None else None
+            key = ('scroll', d, na, nb, tuple(sc['speeds']), sc.get('blend', 'OPAQUE'), spec)
             if key not in mat_index:
                 mat_index[key] = len(materials)
-                materials.append(scroll_record(len(materials), d, na, nb, sc['speeds'], sc.get('blend', 'OPAQUE')))
+                materials.append(scroll_record(len(materials), d, na, nb, sc['speeds'], sc.get('blend', 'OPAQUE'),
+                                               spec))
             if any(len(v) < 6 for v in m['verts']):
                 raise ValueError('a scrolling mesh needs a tangent and binormal on every vertex')
             for verts, tris in split_mesh(m['verts'], m['tris']):
-                parts.append((mat_index[key], verts, tris, m.get('node', 0), True))
+                parts.append((mat_index[key], verts, tris, m.get('node', 0), True, tuple(m.get('lights', ()))))
+            continue
+        if 'material' in m and m['material'].get('game') is not None:      # the game's own shader and settings
+            md = m['material']
+            g = md['game']
+            tex = tuple(absolute(t) for t in md['textures'])
+            spec = tuple(md.get('specular', (0, 0, 0, 0)))
+            key = ('game', tuple(sorted(g.items())), tex, spec)
+            if key not in mat_index:
+                mat_index[key] = len(materials)
+                materials.append(game_record(len(materials), g, tex, spec))
+            fmt = SHADER_FORMAT[g['shader']]
+            if VERTEX_MASK[fmt] & 0x1000 and any(len(v) < 6 for v in m['verts']):
+                raise ValueError('a %s mesh needs a tangent and binormal on every vertex' % g['shader'])
+            for verts, tris in split_mesh(m['verts'], m['tris']):
+                parts.append((mat_index[key], verts, tris, m.get('node', 0), ('game', fmt), tuple(m.get('lights', ()))))
             continue
         if 'material' in m:
             md = m['material']
@@ -504,11 +593,11 @@ def build_model(tpl, meshes, texture_base_index, rb_base, nodes=None, material_u
         if bump and any(len(v) < 6 for v in m['verts']):
             raise ValueError('a normal-mapped mesh needs a tangent and binormal on every vertex')
         for verts, tris in split_mesh(m['verts'], m['tris']):
-            parts.append((mat_index[key], verts, tris, m.get('node', 0), bump))
+            parts.append((mat_index[key], verts, tris, m.get('node', 0), bump, tuple(m.get('lights', ()))))
 
     vdata = bytearray()
     vb_entries, mesh_chunks = [], []
-    for i, (mi, verts, tris, node_i, bump) in enumerate(parts):
+    for i, (mi, verts, tris, node_i, bump, lights) in enumerate(parts):
         pad = -(rb_base + len(vdata)) % ALIGN
         vdata += b'\0' * pad
         rel = rb_base + len(vdata)
@@ -519,8 +608,18 @@ def build_model(tpl, meshes, texture_base_index, rb_base, nodes=None, material_u
             e[0], e[1], e[2] = r['format'], r['vertex_size'], r['vertex_size']
             if r['format'] in VERTEX_MASK:
                 struct.pack_into('<I', e, 0x04, VERTEX_MASK[r['format']])
+            elif r.get('mask') is not None:                  # a format not in the table: the mesh's own mask
+                struct.pack_into('<I', e, 0x04, r['mask'])
             n_verts = len(r['vertex_bytes']) // r['vertex_size']
             pts = [struct.unpack_from('<3f', r['vertex_bytes'], k * r['vertex_size']) for k in range(n_verts)]
+        elif isinstance(bump, tuple) and bump[0] == 'game':
+            fmt = bump[1]
+            for vert in verts:
+                vdata += pack_vertex(fmt, vert)
+            e[0], e[1], e[2] = fmt, FORMAT_LAYOUTS[fmt][0], FORMAT_LAYOUTS[fmt][0]
+            struct.pack_into('<I', e, 0x04, VERTEX_MASK[fmt])
+            n_verts = len(verts)
+            pts = [vert[0] for vert in verts]
         elif bump == 'lm':
             for vert in verts:
                 pos, nrm, uv = vert[:3]
@@ -562,6 +661,14 @@ def build_model(tpl, meshes, texture_base_index, rb_base, nodes=None, material_u
         struct.pack_into('<3f', hdr, 0x24, *hi)
         struct.pack_into('<4H', hdr, 0x40, mi, node_i, i, 5)
         struct.pack_into('<3I', hdr, 0x48, min(idx), len(tris), len(idx))
+        if not (isinstance(verts, dict) and 'header' in verts):
+            # the draw's light list (payload +0x28 count, +0x2C indices; the draw handler 0x1513F0 hands them to
+            # 0x14DAC0, which makes them the draw's light set): run-time light objects by number, as the town's
+            # area models use them: Blender light linking, townlights.draw_lights); empty = the environment's light set
+            if len(lights) > 12:
+                raise ValueError('a draw holds at most 12 lights')
+            hdr[0x30] = len(lights)
+            hdr[0x34:0x34 + 12] = bytes(lights) + bytes(12 - len(lights))
         body = _pad(bytes(hdr[8:]) + struct.pack('<%dH' % len(idx), *idx), 4)
         mesh_chunks.append(struct.pack('<II', 0x02, 8 + len(body)) + body)
 
@@ -599,7 +706,7 @@ def raw_mesh(b, mesh, rb_off, apply_node=True):
             struct.pack_into('<3f', data, k * size, *alr.apply(mtx, p))
     tris = alr.triangles_from_indices(mesh['indices'], mesh['primitive'])
     out = dict(raw=dict(material=bytes(mesh['materials'][mesh['material']]['raw']), format=vb['format'],
-                        vertex_size=size, vertex_bytes=bytes(data), tris=tris,
+                        vertex_size=size, vertex_bytes=bytes(data), tris=tris, mask=vb.get('mask'),
                         header=bytes(b[mesh['offset']:mesh['offset'] + 0x68])))
     if not apply_node:
         out['node'] = mesh['node']
@@ -609,7 +716,7 @@ def raw_mesh(b, mesh, rb_off, apply_node=True):
 # ---------------------------------------------------------------- the whole file
 
 def rebuild(b, replace=None, textures=(), clear=(), shadows_for=(), shadow_mode='minimal', add_models=(),
-            shadow_source=None):
+            shadow_source=None, replace_textures=None):
     """New .alr bytes.
 
     replace:     {root index: list of meshes} (see build_model); texture indices refer to `textures`.
@@ -638,7 +745,23 @@ def rebuild(b, replace=None, textures=(), clear=(), shadows_for=(), shadow_mode=
         for lvl in t['levels']:
             rb += lvl
         new_entries.append(texture_record(tpl['texture'], t['name'], t['width'], t['height'],
-                                          t.get('mips', len(t['levels'])), rel, t.get('format', TEX_FORMAT)))
+                                          t.get('mips', len(t['levels'])), rel, t.get('format', TEX_FORMAT),
+                                          t.get('cube', False)))
+    # textures written again under their own number (replace_textures: {number: texture}); the old data, unused,
+    # goes with strip_unused
+    if replace_textures:
+        tex_entries = bytearray(tex_entries)
+        for i, t in sorted(replace_textures.items()):
+            rb += b'\0' * (-len(rb) % ALIGN)
+            rel = len(rb)
+            for lvl in t['levels']:
+                rb += lvl
+            old = bytes(tex_entries[i * 0x1C:(i + 1) * 0x1C])
+            tex_entries[i * 0x1C:(i + 1) * 0x1C] = texture_record(old, t['name'], t['width'], t['height'],
+                                                                  t.get('mips', len(t['levels'])), rel,
+                                                                  t.get('format', TEX_FORMAT),
+                                                                  t.get('cube', False))
+        tex_entries = bytes(tex_entries)
     n_tex = t15[2] + len(new_entries)
     tex_chunk = struct.pack('<III', 0x15, 0xC + 0x1C * n_tex, n_tex) + tex_entries + b''.join(new_entries)
     tex_chunk = tex_chunk + bytes(b[hsize + 0xC + 0x1C * t15[2]:hsize + t15[1]])   # keep any trailing bytes

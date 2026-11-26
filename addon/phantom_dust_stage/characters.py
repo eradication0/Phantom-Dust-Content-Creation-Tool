@@ -1281,7 +1281,10 @@ def export_character(context, arm, data, target, variants=(0, 1, 2, 3), move='AU
             f.write(payload)
         written.append(fn)
     mv = set_movement(arm, data) if move == 'AUTO' else None if move == 'KEEP' else int(move)
+    anim_set = str(arm.get('pd_anim_set', ''))
+    src = charaset_record(data, anim_set[2:], original=True) if anim_set.startswith('B:') else None
     patched = patch_charaset(data, target, move=mv, voice=None if voice == 'KEEP' else voice, exmot=ex_len,
+                             exmot_tail=src['exmot'] if src else None,
                              box=character_hitbox(arm))
     rec = charaset_record(data, target)
     extra = ''
@@ -1354,7 +1357,7 @@ def set_movement(arm, data):
     return r['move'] if r else None
 
 
-def patch_charaset(data, target, move=None, voice=None, exmot=None, box=None):
+def patch_charaset(data, target, move=None, voice=None, exmot=None, box=None, exmot_tail=None):
     """Change the target's record in both charaset files (the game's own copies saved first)."""
     done = []
     for path in charaset_paths(data):
@@ -1369,7 +1372,14 @@ def patch_charaset(data, target, move=None, voice=None, exmot=None, box=None):
         rec = cs.record_of(b, target)
         ex = None
         if exmot is not None and rec is not None:
-            ex = [int(round(exmot[k])) if rec['exmot'][k] else 0 for k in range(6)]
+            # +0x40 is not the clip length: it is the length L of the end range of the extra motion that the
+            # fighter keeps playing while the pose is held (the call that reads it plays the range
+            # (length - L, length); L = 0: the clip holds its last frame). In every record of the game it is far
+            # shorter than the clip (pc05a: 50 and 40 for clips of 176 and 154 frames). Writing the clip length
+            # made the held range the whole clip. Keep the value of the record the animations came from
+            # (exmot_tail), else the target's own, never longer than the new clip.
+            tail = exmot_tail or rec['exmot']
+            ex = [min(int(tail[k]), int(round(exmot[k]))) if rec['exmot'][k] and tail[k] > 0 else 0 for k in range(6)]
         with open(path, 'wb') as f:
             f.write(cs.patch(b, target, move=move, voice=voice, exmot=ex, box=box))
         done.append(fn)

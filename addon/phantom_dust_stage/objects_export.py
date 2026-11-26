@@ -74,6 +74,71 @@ def _collider_tris(depsgraph, items, scale, surface):
     return tris
 
 
+def placement(o, scale, tc, preset):
+    """One placement's values for the .dat: dict(pos, rot[, extra])."""
+    mw = o.matrix_world
+    rot = cv.rot_to_game([list(r) for r in mw.to_3x3().normalized()])     # any rotation, as the game's own
+    p = dict(pos=cv.to_game(mw.translation, scale), rot=rot)
+    if o.get('pd_layouts'):                            # the placement lists it is in (default: list 0 only)
+        p['slots'] = tuple(sorted({int(x) for x in o['pd_layouts']}))
+    if o.get('pd_extra'):                              # spare placement bytes kept from an imported map
+        p['extra'] = tuple(int(x) for x in o['pd_extra'])
+    if o.get('pd_class'):                              # the placement's own behaviour class (table, class)
+        p['class'] = tuple(int(x) for x in o['pd_class'])[:2]
+    if preset == 'JUMP_PAD':
+        # The game's jump pads put the jump strength in the first spare placement byte (100-250); a pad imported
+        # with another power than its collection's keeps its own (pd_jump_power)
+        power = o.get('pd_jump_power') or getattr(tc, 'pd_jump_power', 150)
+        p['extra'] = (max(1, min(255, int(power))), 0)
+    return p
+
+
+def placed_entries(obj_colls, scale, types_of=None):
+    """[(offset in the .dat, placement dict)] of every placement imported from the game original's file
+    (pd_placement), or None when one has none or two share one (copied after the import). types_of (a dict) gets
+    {offset: object type name} (the names gather gives the types)."""
+    out, seen = [], set()
+    for oc in obj_colls:
+        for tc in oc.children:
+            preset = getattr(tc, 'pd_preset', 'SOLID')
+            groups = _groups(tc)
+            for g, (_key, insts) in enumerate(groups):
+                name = tc.name if len(groups) == 1 else '%s_%d' % (tc.name, g + 1)
+                for o in insts:
+                    off = o.get('pd_placement')
+                    if off is None or off in seen:
+                        return None
+                    seen.add(off)
+                    out.append((int(off), placement(o, scale, tc, preset)))
+                    if types_of is not None:
+                        types_of[int(off)] = name
+    return out
+
+
+def placed_split(obj_colls, scale):
+    """Placements of the scene against the file they were imported from: (kept, new). kept = [(offset in the
+    .dat, placement dict, type name)] for objects that carry their own entry (pd_placement); new = [(type name,
+    placement dict, offset of the entry it was copied from or None)] for objects added after the import (a copy
+    of an imported object carries its original's pd_placement: the first one keeps the entry, the others are
+    new). Type names are the ones gather gives."""
+    kept, new, seen = [], [], set()
+    for oc in obj_colls:
+        for tc in oc.children:
+            preset = getattr(tc, 'pd_preset', 'SOLID')
+            groups = _groups(tc)
+            for g, (_key, insts) in enumerate(groups):
+                name = tc.name if len(groups) == 1 else '%s_%d' % (tc.name, g + 1)
+                for o in insts:
+                    off = o.get('pd_placement')
+                    p = placement(o, scale, tc, preset)
+                    if off is None or int(off) in seen:
+                        new.append((name, p, None if off is None else int(off)))
+                    else:
+                        seen.add(int(off))
+                        kept.append((int(off), p, name))
+    return kept, new
+
+
 def _groups(tc):
     """Placements of one type collection, grouped by what they look like: objects that share a mesh and a scale
     become one game object type (the game stores one model per type). Copies (Shift+D), linked duplicates (Alt+D),
@@ -83,7 +148,10 @@ def _groups(tc):
                      not (o.parent is not None and (part_kind(o.parent) or o.parent.get('pd_part')))),
                     key=lambda o: cv.natural_key(o.name)):
         sc = tuple(round(x, 4) for x in o.matrix_world.to_scale())
-        groups.setdefault((_mesh_key(o), sc), []).append(o)
+        # an imported object definition's own values (sounds, root values) keep definitions that share a model
+        # apart (st06 oilcanA / oilcanB: other hits and break sound, one mesh)
+        own = (tuple(o.get('pd_object_sounds', ())), str([list(r) for r in o.get('pd_root_values', ())]))
+        groups.setdefault((_mesh_key(o), sc, own), []).append(o)
     return list(groups.items())
 
 
@@ -108,7 +176,7 @@ def gather(context, obj_colls, scale, textures):
     for oc in obj_colls:
         for tc in oc.children:
             groups = _groups(tc)
-            for g, ((_key, sc), insts) in enumerate(groups):
+            for g, ((_key, sc, _own), insts) in enumerate(groups):
                 name = tc.name if len(groups) == 1 else '%s_%d' % (tc.name, g + 1)
                 t = _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats)
                 if t is None:
@@ -121,6 +189,28 @@ def gather(context, obj_colls, scale, textures):
 def tc_scene(tc):
     import bpy
     return bpy.context.scene.pd_game_original
+
+
+def _with_fins(parts):
+    """Shadow-volume parts (game shader sshadow / sshadowch, which the game stretches along the light while
+    drawing) get the zero-area strips on every edge between faces of different normals (alr_build.shadow_fins:
+    the game stretches them into the volume's sides); sshadowc volumes are already stretched and have none."""
+    for part in parts.values():
+        md = part.get('material')
+        g = md.get('game') if isinstance(md, dict) else None
+        if g and g.get('shader') in ('sshadow', 'sshadowch') and part['tris']:
+            # every face its own corners, as in the game's volumes: then every edge gets its strip, also between
+            # two faces of one plane (36 faces -> 108 strip triangles on st02's walls, as the game's)
+            verts, tris = [], []
+            for t in part['tris']:
+                tris.append(tuple(range(len(verts), len(verts) + 3)))
+                verts += [part['verts'][i] for i in t]
+            # a strip only where the two faces' normals differ (the game's volumes: a strip between two faces of
+            # one normal stretches to nothing; st03's volumes leave those out)
+            fins = [f for f in alr_build.shadow_fins(verts, tris)
+                    if sum(a * b for a, b in zip(verts[f[0]][1], verts[f[2]][1])) < 0.99999]
+            part['verts'], part['tris'] = verts, tris + fins
+    return parts
 
 
 def _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats):
@@ -159,56 +249,95 @@ def _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats):
     owner = next((o for o in insts if any(part_kind(c) for c in o.children)), None)
     inv = owner.matrix_world.inverted() if owner is not None else Matrix.Identity(4)
 
+    def in_owner(c):
+        """c's matrix in the owner's space, from the parent-relative matrices: the same numbers wherever the
+        owner placement stands (inv @ c.matrix_world carries float noise from the owner's world matrix, so
+        moving a placement changed the model's bytes)."""
+        # rest poses (stage_extras.rest_local): an object animation keys the delta transforms, which stay out
+        from .stage_extras import rest_local
+        m, p = rest_local(c), c.parent
+        while p is not None and p != owner:
+            m = rest_local(p) @ m
+            p = p.parent
+        return m if p == owner else inv @ c.matrix_world
+
     def parts(kind):
         if owner is not None:
-            return [(c, size @ inv @ c.matrix_world) for c in sorted(owner.children, key=lambda c: cv.natural_key(c.name))
+            return [(c, size @ in_owner(c)) for c in sorted(owner.children, key=lambda c: cv.natural_key(c.name))
                     if part_kind(c) == kind]
         coll = _child(tc, kind)
         return [(o, size @ o.matrix_world) for o in coll.all_objects if o.parent is None or
                 o.parent.name not in coll.all_objects] if coll is not None else []
+
+    # the intact model's shadow volume (part shadow_: sshadow / sshadowch / sshadowc material) on a joint of its
+    # own under the root, as the game's files have it
+    shadows = [(o, m) for o, m in parts('shadow') if o.type == 'MESH']
+    if shadows and models[0] is not None:
+        smeshes = []
+        for o, m in shadows:                                # one volume per object: its strips stay within it
+            smeshes += resolve(to_meshes(_with_fins(mesh_parts(depsgraph, o, m, scale, textures, stats)), node=1))
+        if smeshes:
+            models[0]['nodes'].append(dict(flags=0x0004, parent=0))
+            models[0]['meshes'] += smeshes
 
     # Broken model: node 0 = root (damage), then one node per piece (child of the root) followed by its own
     # children's nodes (shadow, detail: they move with the piece). Piece values as in the game's files: value 1
     # = the flying piece can hurt players (the game's pieces use 2-4), marker STAY_MARKER = the piece stays.
     hurt = getattr(tc, 'pd_pieces_hurt', True)
     pieces = [(o, m) for o, m in parts('broken') if o.type == 'MESH']
+    piece_nodes = []                                         # (piece, node index, matrix written): animations
     if pieces:
         meshes, nodes = [], [dict(flags=0x0000, values=_root_values(insts, 1, (0, 0, 0, 0)))]
         for p, m in pieces:
             k = len(nodes)
+            piece_nodes.append((p, k, m))
             v = (int(p.get('pd_piece_value', 0) or 0) or 4) if hurt else 0     # the game's pieces use 2-4
             stay = p.name.lower().startswith('stay_') or (not p.name.lower().startswith('break_') and p.get('pd_stay'))
             own = resolve(to_meshes(mesh_parts(depsgraph, p, m, scale, textures, stats), node=k))
             nodes.append(dict(flags=0x0004, parent=0, values=(v, 0, 0, 0), box=_mass_box(own, p),
                               marker=alr_build.STAY_MARKER if stay else 0xFFFFFFFF))
             meshes += own
+            shadow_node = None                               # the piece's shadow volumes share one joint
             for c in sorted((c for c in p.children_recursive if c.type == 'MESH'), key=lambda c: cv.natural_key(c.name)):
-                nodes.append(dict(flags=0x0004, parent=k))
-                meshes += resolve(to_meshes(mesh_parts(depsgraph, c, size @ inv @ c.matrix_world if owner else
-                                                       size @ c.matrix_world, scale, textures, stats), node=len(nodes) - 1))
+                is_shadow = ' shadow ' in c.name.lower()
+                if not is_shadow or shadow_node is None:
+                    nodes.append(dict(flags=0x0004, parent=k))
+                    if is_shadow:
+                        shadow_node = len(nodes) - 1
+                node_c = shadow_node if is_shadow else len(nodes) - 1
+                meshes += resolve(to_meshes(_with_fins(mesh_parts(depsgraph, c, size @ in_owner(c) if owner else
+                                                       size @ c.matrix_world, scale, textures, stats)), node=node_c))
         if meshes:
             models[1] = dict(meshes=meshes, nodes=nodes)
     debris = [(o, m) for o, m in parts('debris') if o.type == 'MESH']
     if debris:
-        dparts = {}
+        dparts, meshes = {}, []
         for p, m in debris:
-            mesh_parts(depsgraph, p, m, scale, textures, stats, dparts)
-        meshes = resolve(to_meshes(dparts))
+            if p.name.lower().startswith('debris_shadow_'):  # a shadow volume: its own part (strips within it),
+                # on a joint of its own under the debris root, as the game's
+                meshes += resolve(to_meshes(_with_fins(mesh_parts(depsgraph, p, m, scale, textures, stats)), node=1))
+            else:
+                mesh_parts(depsgraph, p, m, scale, textures, stats, dparts)
+        visible = resolve(to_meshes(dparts))
+        meshes = visible + meshes
         if meshes:
             stays = getattr(tc, 'pd_debris_stays', False)
-            models[2] = dict(meshes=meshes, nodes=[dict(flags=0x0004, box=_mass_box(meshes, debris[0][0]),
-                                                        values=_root_values(insts, 2, (0 if stays else 2, damage, 0, 0)))])
+            models[2] = dict(meshes=meshes, nodes=[dict(flags=0x0004, box=_mass_box(visible or meshes, debris[0][0]),
+                                                        values=_root_values(insts, 2, (0 if stays else
+                                                                                       _debris_goes(insts), damage, 0, 0)))])
+            if len(meshes) > len(visible):
+                models[2]['nodes'].append(dict(flags=0x0004, parent=0))
 
     if models[0] is not None:                               # damage on the intact root when there is no debris
         models[0]['nodes'][0]['values'] = _root_values(
             insts, 0, (0, damage if models[2] is None else 0, hits if hits > 1 else 0, 0),
             known=(1, 2) if models[2] is None else (2,))
 
-    if no_model:
-        collision = _collider_tris(depsgraph, [(insts[0], size)], scale, surface)
+    if no_model:                                            # the mesh itself, plus colliders of other kinds
+        collision = _collider_tris(depsgraph, [(insts[0], size)] + parts('collider'), scale, surface)
     else:
         collision = _collider_tris(depsgraph, parts('collider'), scale, surface)
-    if not collision and intact:
+    if not collision and intact and not any(o.get('pd_no_collider') for o in insts):   # default: a box
         pts = [v[0] for m in intact for v in m['verts']]
         lo = tuple(min(p[k] for p in pts) for k in range(3))
         hi = tuple(max(p[k] for p in pts) for k in range(3))
@@ -230,26 +359,15 @@ def _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats):
         if models[2] is None:
             effects[2] = None
 
-    placements = []
-    for o in insts:
-        mw = o.matrix_world
-        rot = cv.rot_to_game([list(r) for r in mw.to_3x3().normalized()])     # any rotation, as the game's own
-        p = dict(pos=cv.to_game(mw.translation, scale), rot=rot)
-        if o.get('pd_extra'):                              # spare placement bytes kept from an imported map
-            p['extra'] = tuple(int(x) for x in o['pd_extra'])
-        placements.append(p)
-    if preset == 'JUMP_PAD':
-        # The game's jump pads put the jump strength in the first spare placement byte (100-250).
-        power = max(1, min(255, int(getattr(tc, 'pd_jump_power', 150))))
-        for p in placements:
-            p['extra'] = (power, 0)
+    placements = [placement(o, scale, tc, preset) for o in insts]
+    # object animations: the broken pieces' Actions (stage_extras); the written model's pieces have rest pose
+    # identity (their meshes are written where they stand), so the tracks are the pieces' motion from there
     anims = None
-    src = next((o for o in insts if o.get('pd_object_anims')), None)
-    if src is not None:
-        anims = [bytes.fromhex(x) if x else None for x in src['pd_object_anims']]
-        for k in (1, 2):
-            if models[k] is None:
-                anims[k] = None
+    if models[1] is not None and piece_nodes:
+        from .stage_extras import export_piece_animation
+        run = export_piece_animation([(p, k, m) for p, k, m in piece_nodes], scale)
+        if run is not None:
+            anims = [None, run, None]
     if (category, typ) in objects_build.NEEDS_ANIMATION and not (anims and any(anims)):
         print('Phantom Dust export warning: %s (game type %d-%d) moves by an animation it no longer has; '
               'left out (the game would crash)' % (tc.name, category, typ))
@@ -264,6 +382,17 @@ def _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats):
             sounds[k] = int(choice, 16)
     return dict(name=name, models=models, collision=collision, collisions=collisions, effects=effects, anims=anims,
                 sounds=sounds, category=category, type=typ, placements=placements, preset=preset)
+
+
+def _debris_goes(insts):
+    """Debris root value 0 when the debris does not stay: the imported object's own (2 or 3 in the game's files),
+    else 2."""
+    src = next((o for o in insts if o.get('pd_root_values')), None)
+    try:
+        v = int(round(float(src['pd_root_values'][2][0]))) if src is not None else 0
+    except (IndexError, TypeError, ValueError):
+        v = 0
+    return v if v > 0 else 2
 
 
 def _mass_box(meshes, ob):
@@ -306,6 +435,7 @@ def add_to_files(types, alr_add_models, alr_added_roots):
                             collisions=t.get('collisions'), effects=t.get('effects'), anims=t.get('anims'),
                             sounds=t.get('sounds')))
         for p in t['placements']:
-            placements.append(dict(object=idx, category=t['category'], type=t['type'], pos=p['pos'], rot=p['rot'],
-                                   extra=p.get('extra', (0, 0))))
+            cat, typ = p.get('class') or (t['category'], t['type'])
+            placements.append(dict(object=idx, category=cat, type=typ, pos=p['pos'], rot=p['rot'],
+                                   extra=p.get('extra', (0, 0)), slots=p.get('slots', (0,))))
     return objects, placements
