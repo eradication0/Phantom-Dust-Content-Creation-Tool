@@ -5,7 +5,9 @@ section 2). Header: u32 file size, u32 count (47), u32 string-pool offset, u32 0
 Fields used here: +0x00 model folder (pc00a...), +0x04 name, +0x0C capsule height, +0x0E capsule width, +0x10 hit
 radius, +0x12 hit centre height (all x 0.1 game units: the body collider and the hit volume), +0x36 movement skill
 (750 jump, 751 cartwheel / dash), +0x3C voice bank file name (BattleVo_<Name>.bin, the language suffix is added
-by the game; NPC records hold an unused out-of-pool value), +0x40 six exmot clip lengths in frames.
+by the game; NPC records hold an unused out-of-pool value), +0x40 six s16: for each exmot clip, the length of its
+end range the fighter keeps playing while the pose is held (0 = it holds the last frame; always shorter than the
+clip, only the first two are set).
 The Japanese file is used when the game language is Japanese, else the _en file; their numbers are equal, only
 the strings differ, so both are edited the same way.
 """

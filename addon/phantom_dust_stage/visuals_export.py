@@ -9,9 +9,9 @@ sdrefs, sbtsrefs). Any other material exports as before: its image, baked light 
 colour attribute), and no highlight.
 
 Per triangle: position, the corner normal, the active UV map (game V = 1 - Blender V), the vertex colour
-(RGB = baked light, A = shine mask) and, for normal-mapped materials, Blender's tangent and bitangent for that
-UV map (the game reads them as stored: tangent = +U, binormal = +V in Blender's UV space, so OpenGL-style
-normal maps work unchanged).
+(RGB = baked light, A = shine mask) and, for normal-mapped materials, the game's tangent frame for that UV map:
+binormal = Blender's bitangent (+V in Blender's UV space), tangent = normal x binormal in game space (the game's
+own rule on every map; it stores no handedness, so on mirrored UVs the tangent is -U, as in the game's files).
 
 Textures: an image whose name matches a texture in the game original (as the import names them) reuses that
 texture. Others are added resized to a power of two (largest side at most 512), DXT1/DXT5 compressed with a full
@@ -144,9 +144,125 @@ def image_levels(img, alpha_scale=1.0, normal_strength=1.0, lightmap_ambient=Non
     return W, H, levels
 
 
-def compress(levels, w, h):
+def cube_texture(img):
+    """A cube map image (pd_cube_map: six square faces side by side, each face's mip levels stacked under it; an
+    image of one row of faces gets its levels made by halving) as a texture dict: each face's levels encoded like any
+    texture (DXT1 opaque, DXT5 with alpha; never 1-bit-alpha DXT1, which would lose colours under alpha 0), padded to
+    128 bytes, faces one after the other (pdstage/cubemap.py); cube=True sets the descriptor's cube bit."""
+    from ._lib import cubemap
+    w, h = img.size
+    px = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    size = w // 6
+    if w % 6 or size < 1 or h < size:
+        raise VisualsError('cube map %s is %d x %d: six square faces side by side are needed' % (img.name, w, h))
+    if h > size:                                             # the levels are in the image
+        faces = cubemap.levels_from_atlas(px, w, h)
+    else:
+        faces = []
+        for f in range(6):
+            face = bpy.data.images.new('_pd_face', size, size, alpha=True)
+            try:
+                face.pixels.foreach_set(px.reshape(h, w, 4)[:, f * size:(f + 1) * size].ravel())
+                _fw, _fh, levels = image_levels(face)
+            finally:
+                bpy.data.images.remove(face)
+            faces.append([np.frombuffer(l, np.uint8).reshape(max(1, size >> k), max(1, size >> k), 4)[..., [2, 1, 0, 3]]
+                          for k, l in enumerate(levels)])
+    data, fmt, mips = bytearray(), None, len(faces[0])
+    # one format for the six faces (the descriptor has one): with alpha when any face has it (st07's s7_envmap_h:
+    # alpha 0 on part of +Z only; mixed DXT1 / DXT5 faces were read with the wrong block size)
+    alpha = any(bool((levels[0][..., 3] < 255).any()) for levels in faces)
+    for levels in faces:
+        bgra = [l[..., [2, 1, 0, 3]].tobytes() for l in levels]
+        c = compress(bgra, size, size, punch_ok=False, alpha=alpha)
+        fmt = c.get('format', fmt)
+        blob = b''.join(c['levels'])
+        data += blob + b'\0' * (-len(blob) % 128)
+    return dict(name=game_texture_name(img.name), width=size, height=size, levels=[bytes(data)], mips=mips,
+                format=fmt, cube=True)
+
+
+def _game_storage(img):
+    """The game storage format an imported image keeps (pdstage/texlevels.py), or None (a new image, or one
+    imported before this was recorded with an unknown format)."""
+    from ._lib import texlevels
+    s = img.get('pd_texture_storage')
+    s = 'b8g8r8a8' if s == 'plain' else s                    # scenes imported before the format names
+    return s if s in texlevels.CODE else None
+
+
+def _level_arrays(levels, w, h):
+    out = []
+    for lvl in levels:
+        out.append(np.frombuffer(lvl, np.uint8).reshape(h, w, 4)[..., [2, 1, 0, 3]])
+        w, h = max(1, w // 2), max(1, h // 2)
+    return out
+
+
+def stored_mip_levels(img, w, h, n):
+    """Levels 1 .. n-1 (uint8 RGBA, top row first) from the image's lower-levels image (pd_mip_image, made by the
+    import from the game's own levels), or None when they are to be made again from level 0. The rule: they are
+    the texture's levels while the image is the imported picture: not painted in this session (is_dirty), not
+    replaced by a file (no longer packed), the same size; and the lower-levels image has the layout's size. A
+    painted or replaced level 0 gets levels made from it (box reduction), as does Regenerate Mip Levels."""
+    from ._lib import texlevels
+    mi = img.get('pd_mip_image')
+    if n < 2 or mi is None or not isinstance(mi, bpy.types.Image) or mi.size[0] == 0:
+        return None
+    if img.is_dirty or img.packed_file is None or tuple(img.size) != (w, h):
+        return None
+    px = np.empty(mi.size[0] * mi.size[1] * 4, dtype=np.float32)
+    mi.pixels.foreach_get(px)
+    return texlevels.levels_from_atlas(px, mi.size[0], mi.size[1], w, h, n)
+
+
+def regenerate_mip_image(img):
+    """Make the image's lower-levels image (pd_mip_image) again from its level 0 (box reduction). Returns True when
+    there was one to make."""
+    from ._lib import texlevels
+    mi = img.get('pd_mip_image')
+    n = int(img.get('pd_mip_levels', 0) or 0)
+    if mi is None or not isinstance(mi, bpy.types.Image) or n < 2 or img.size[0] == 0:
+        return False
+    w, h, levels = image_levels(img)
+    arrs = _level_arrays(levels[:n], w, h)
+    if len(arrs) < 2:
+        return False
+    aw, ah, px = texlevels.mip_atlas(arrs[1:])
+    if tuple(mi.size) != (aw, ah):
+        mi.scale(aw, ah)
+    mi.pixels.foreach_set(px.ravel())
+    mi.update()
+    if mi.packed_file is not None:
+        mi.pack()
+    return True
+
+
+def game_texture(img):
+    """An imported game texture (pd_texture_storage) written in the game's own format: B8G8R8A8 and the 16-bit
+    formats stay uncompressed (linear rows, or swizzled when imported from the original Xbox release), DXT1 / DXT3 /
+    DXT5 stay so; every mip level the game has, the lower ones from the lower-levels image (stored_mip_levels)."""
+    from ._lib import texlevels
+    storage = _game_storage(img)
+    w, h, levels = image_levels(img)
+    keep = int(img.get('pd_mip_levels', 0) or 0)
+    arrs = _level_arrays(levels[:max(1, keep)] if keep else levels, w, h)
+    stored = stored_mip_levels(img, w, h, len(arrs))
+    if stored is not None:
+        arrs = arrs[:1] + stored
+    swz = bool(img.get('pd_texture_swizzled')) and storage in texlevels.BPP
+    # DXT1 with 1-bit alpha (the game's cut-outs) when level 0 has a transparent texel; every level the same way
+    punch = storage == 'dxt1' and bool((arrs[0][..., 3] < 128).any())
+    data = [texlevels.encode_level(a, storage, swz, punch) for a in arrs]
+    return dict(name=game_texture_name(img.name), width=w, height=h, levels=data, mips=len(data),
+                format=texlevels.raw_format_byte(storage, swz), mips_kept=stored is not None)
+
+
+def compress(levels, w, h, keep_alpha=False, punch_ok=True, alpha=None):
     """BGRA mip levels -> dict(levels, format) compressed like the game's own textures (DXT1 when opaque,
-    DXT5 with alpha): a quarter to an eighth of the size. Falls back to plain BGRA if numpy can't do it."""
+    DXT5 with alpha): a quarter to an eighth of the size. Falls back to plain BGRA if numpy can't do it.
+    keep_alpha: DXT5 whatever the alpha (a game texture stored DXT3/DXT5)."""
     from ._lib import dxt
     try:
         arrs, lw, lh = [], w, h
@@ -154,8 +270,14 @@ def compress(levels, w, h):
             a = np.frombuffer(lvl, dtype=np.uint8).reshape(lh, lw, 4)[..., [2, 1, 0, 3]]
             arrs.append(a)
             lw, lh = max(1, lw // 2), max(1, lh // 2)
-        alpha = dxt.needs_alpha(arrs[0])
-        out = [dxt.encode(a, alpha) for a in arrs]
+        alpha = (dxt.needs_alpha(arrs[0]) if alpha is None else alpha) or keep_alpha
+        # 1-bit alpha (the game's DXT1 cut-outs): DXT1 again. Not when nothing is opaque: DXT1 stores a transparent
+        # texel as black, so a texture whose alpha is 0 everywhere (st16's normal maps, DXT5 with alpha 0: a
+        # mask) came out black and darkened the whole map; not for a game DXT3/DXT5 texture (keep_alpha) and not
+        # for a cube map (punch_ok False: its colours under alpha 0 are kept, as DXT5)
+        punch = punch_ok and not keep_alpha and dxt.binary_alpha(arrs[0]) and bool((arrs[0][..., 3] > 127).any())
+        alpha = alpha and not punch
+        out = [dxt.encode(a, alpha, punch) for a in arrs]
         return dict(levels=[d for _f, d in out], format=out[0][0])
     except (ValueError, MemoryError):
         return dict(levels=levels)
@@ -176,6 +298,7 @@ class Textures:
         self.by_content = {}                           # identical images (copies like wall.001) share one texture
         self.key = {}
         self.reused = 0
+        self.replaced = {}                             # built from the scene: {texture number: texture} (rebuild)
 
     def ref(self, img, alpha_scale=1.0, normal_strength=1.0, tint=(1.0, 1.0, 1.0), alpha_value=None):
         """Texture ref for an image (times `tint`, sRGB 0-1); no image: a 4 x 4 texture of the colour `tint`.
@@ -195,9 +318,38 @@ class Textures:
                 name += '_a%02x' % a
             self.new.append(dict(name=name, width=4, height=4, levels=[px * 16, px * 4, px]))
         elif alpha_scale == 1.0 and normal_strength == 1.0 and tint == (1.0, 1.0, 1.0) and alpha_value is None \
-                and game_texture_name(img.name) in self.base_by_name:
+                and game_texture_name(img.name) in self.base_by_name and _reuse_by_name():
+            # fallback only ("Preserve unedited parts"): an image named like one of the replaced map's textures
+            # uses that texture's bytes. Built from the scene, every texture is encoded from its Blender image
             ref = ('base', self.base_by_name[game_texture_name(img.name)])
             self.reused += 1
+        elif alpha_scale == 1.0 and normal_strength == 1.0 and tint == (1.0, 1.0, 1.0) and alpha_value is None \
+                and game_texture_name(img.name) in self.base_by_name:
+            # built from the scene: an image named like one of the replaced map's textures is encoded from its pixels
+            # into that texture's own number (the map's effects use texture numbers), so each texture is in the file
+            # once
+            i = self.base_by_name[game_texture_name(img.name)]
+            if img.get('pd_cube_map'):
+                self.replaced[i] = cube_texture(img)
+            elif _game_storage(img):
+                self.replaced[i] = game_texture(img)
+            else:
+                w, h, levels = image_levels(img, alpha_scale, normal_strength, tint=tint, alpha_value=alpha_value)
+                keep = int(img.get('pd_mip_levels', 0) or 0)      # the game's own level count (imported images)
+                if keep:
+                    levels = levels[:max(1, keep)]
+                if img.get('pd_texture_storage') == 'plain' and len(levels) == 1:
+                    # a plain-colour texture with one level stays plain (the game's own: glows, sea, sky pictures);
+                    # block compression would change its gradients, extra levels its look at a distance
+                    entry = dict(levels=levels, mips=1)
+                else:
+                    entry = compress(levels, w, h, keep_alpha=img.get('pd_texture_storage') == 'dxt5')                         if self.compress else dict(levels=levels)
+                    entry['mips'] = len(entry['levels'])
+                self.replaced[i] = dict(name=game_texture_name(img.name), width=w, height=h, **entry)
+            ref = ('base', i)
+        elif img.get('pd_cube_map'):
+            ref = ('new', len(self.new))
+            self.new.append(cube_texture(img))
         else:
             w, h, levels = image_levels(img, alpha_scale, normal_strength, tint=tint, alpha_value=alpha_value)
             import hashlib
@@ -311,14 +463,16 @@ class Textures:
             blend = settings.get('scroll_blend', 'OPAQUE')
             fade = 1.0 - settings.get('transparency', 0.0) if blend == 'ALPHA' else 1.0
             strength = settings.get('normal_strength', 1.0)
-            na = self.ref(settings['normal'], normal_strength=strength, alpha_value=self.SCROLL_NORMAL_ALPHA) \
+            nalpha = None if settings.get('scroll_keep_normal_alpha') else self.SCROLL_NORMAL_ALPHA
+            na = self.ref(settings['normal'], normal_strength=strength, alpha_value=nalpha) \
                 if settings['normal'] is not None else self.scroll_flat_normal()
             nb_img = settings.get('normal_b') or settings['normal']
-            nb = self.ref(nb_img, normal_strength=strength, alpha_value=self.SCROLL_NORMAL_ALPHA) \
+            nb = self.ref(nb_img, normal_strength=strength, alpha_value=nalpha) \
                 if nb_img is not None else self.scroll_flat_normal()
             return dict(diffuse=self.ref(settings['diffuse'], fade, tint=tint), transparent=False, normal=na,
                         reflection=None, specular=(0, 0, 0, 0),
-                        scroll=dict(normal_a=na, normal_b=nb, speeds=tuple(settings['scroll_speeds']), blend=blend))
+                        scroll=dict(normal_a=na, normal_b=nb, speeds=tuple(settings['scroll_speeds']), blend=blend,
+                                    specular=tuple(settings['specular']) if nalpha is None else None))
         see = bool(settings.get('transparent'))      # blended shader (..al): the slider fades the texture's alpha
         return dict(diffuse=self.ref(settings['diffuse'], 1.0 - settings.get('transparency', 0.0) if see else 1.0,
                                      tint=tint),
@@ -328,6 +482,32 @@ class Textures:
                     reflection=self.ref(settings['reflection'], settings['reflection_strength'])
                     if settings['reflection'] is not None else None,
                     specular=tuple(settings['specular']))
+
+
+def game_settings(mat, any_shader=False):
+    """A material's game shader and settings (set by the import from the game's material), or None.
+    any_shader: also shaders the generic writer has no vertex format for (lbts: written by the light-map path)."""
+    if mat is None or 'pd_game_shader' not in mat or (
+            not any_shader and mat.get('pd_game_shader') not in alr_build.SHADER_FORMAT):
+        return None
+    params = [int(x) for x in mat.get('pd_shader_params', ())][:8]
+    return dict(shader=str(mat['pd_game_shader']), flags=int(mat.get('pd_material_flags', 0)),
+                filter=int(mat.get('pd_material_filter', 0x10)), blend=int(mat.get('pd_material_blend', 0)),
+                roles=int(mat.get('pd_texture_roles', 1)), colour=_argb(mat.get('pd_material_colour'), 0xFF000000),
+                word_38=_argb(mat.get('pd_material_word_38'), 0), params=tuple(params + [0] * (8 - len(params))))
+
+
+def _argb(v, default):
+    try:
+        a, r, g, b = (int(x) & 0xFF for x in v)
+    except (TypeError, ValueError):
+        return default
+    return a << 24 | r << 16 | g << 8 | b
+
+
+def _reuse_by_name():
+    from . import roundtrip
+    return roundtrip.ENABLED
 
 
 def _corner_reader(me, source, srgb=True):
@@ -391,6 +571,14 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
             if light is not None and me.uv_layers.get(lightbake.UV_NAME) is not None and uvl is not None:
                 lm_uv = me.uv_layers[lightbake.UV_NAME]
                 lm_ref = textures.lightmap(light, lightbake.game_ambient(bpy.context.scene), lightbake.baked_glow(ob))
+        game_lm = False
+        if lm_ref is None and uvl is not None and me.uv_layers.get('PD_LightUV') is not None and any(
+                s.material is not None and str(s.material.get('pd_game_shader', '')).startswith('lbts')
+                for s in ob.material_slots):
+            # the game's own light-mapped surfaces (lbts: the town's floors): their light map image and second UV
+            # map, as imported, written back as lbts (they were written as sbts without the light map: darker)
+            lm_uv = me.uv_layers['PD_LightUV']
+            game_lm = True
         cnormals = me.corner_normals
         co = [matrix @ v.co for v in me.vertices]
         slots_mat = [s.material for s in ob.material_slots]
@@ -407,9 +595,51 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
             if mi not in settings:
                 st = pd_material.read(mat)
                 gmat = textures.material(st)
-                if gmat.get('scroll'):                  # scrolling: tangents always, white light, alpha 255
-                    st = dict(st, normal=st['normal'] or 'flat', light=('const', (255, 255, 255)),
-                              shine=('const', 1.0))
+                game = game_settings(mat) if lm_ref is None and not game_lm and not gmat.get('scroll') else None
+                if game_lm and mat is not None and str(mat.get('pd_game_shader', '')).startswith('lbts'):
+                    # the game's settings (roles 0x0261 or 0x0255, flags, blend ...) and every slot by its role:
+                    # diffuse (1), normal (2), reflection (4: lbtsrefs, the map's cube map), the light map (5/6) and
+                    # any other slot from its own image
+                    g = game_settings(mat, any_shader=True)
+                    imgs = {1: st['diffuse'], 2: st['normal'], 4: st['reflection']}
+                    refs, lm = [], None
+                    for k in range(4):
+                        role = (g['roles'] >> (4 * k)) & 0xF
+                        if ('pd_texture_%d_cube' % k) in mat:
+                            refs.append(('base', int(mat['pd_texture_%d_cube' % k])))
+                            continue
+                        img = imgs.get(role) if imgs.get(role) is not None else mat.get('pd_texture_%d' % k)
+                        refs.append(textures.ref(img) if img is not None and hasattr(img, 'pixels') else
+                                    (textures.flat_normal() if role == 2 else None))
+                        if role in (5, 6) and k > 0 and lm is None:
+                            lm = refs[-1]
+                    gmat = dict(diffuse=refs[0], lightmap=lm or refs[1], normal=st['normal'] and refs[2] or
+                                textures.flat_normal(), reflection=None, specular=gmat['specular'], game=g,
+                                textures=tuple(refs))
+                    st = dict(st, normal=st['normal'] or 'flat', light=('const', (255, 255, 255)))
+                elif game is not None:
+                    # the material keeps the game's shader and settings (pd_game_shader ...): every texture slot
+                    # from the material's maps (by the slot's role) or its own slot image
+                    imgs = {1: st['diffuse'], 2: st['normal'], 4: st['reflection']}
+                    refs = []
+                    for k in range(4):
+                        role = (game['roles'] >> (4 * k)) & 0xF
+                        img = imgs.get(role) if role in imgs and imgs.get(role) is not None else \
+                            (mat.get('pd_texture_%d' % k) if mat is not None else None)
+                        if mat is not None and ('pd_texture_%d_cube' % k) in mat:
+                            refs.append(('base', int(mat['pd_texture_%d_cube' % k])))     # the map's cube map
+                            continue
+                        refs.append(textures.ref(img) if img is not None and hasattr(img, 'pixels') else None)
+                    gmat = dict(game=game, textures=tuple(refs), specular=gmat['specular'])
+                    needs_tangents = alr_build.VERTEX_MASK[alr_build.SHADER_FORMAT[game['shader']]] & 0x1000
+                    st = dict(st, normal=(st['normal'] or 'flat') if needs_tangents else None)
+                elif gmat.get('scroll'):                  # scrolling: tangents always; white light, alpha 255
+                    # unless the material reads the mesh's colours (the game's sky clouds: the vertex colour's alpha
+                    # fades the clouds out toward the horizon, its RGB tints them)
+                    attr = lambda s: s is not None and s[0] == 'attr'
+                    st = dict(st, normal=st['normal'] or 'flat',
+                              light=st['light'] if attr(st['light']) else ('const', (255, 255, 255)),
+                              shine=st['shine'] if attr(st['shine']) else ('const', 1.0))
                 elif lm_ref is not None and not gmat['transparent']:   # light-mapped: lbts (no reflection map;
                     # lbts has no blended variant, so transparent materials keep vertex light)
                     gmat = dict(diffuse=gmat['diffuse'], lightmap=lm_ref,
@@ -460,6 +690,9 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
                 corners.append((cv.to_game(co[vi], scale), cv.to_game(n, 1.0), uv, c) + extra)
             du = math.floor(min(c[2][0] for c in corners))
             dv = math.floor(min(c[2][1] for c in corners))
+            if lm_uv is None and all(-8.0 <= c[2][k] <= UV_LIMIT for c in corners for k in (0, 1)):
+                du = dv = 0                   # within what the vertex holds (s16 / 4096): as they are, so a vertex
+                # shared by several triangles stays one vertex
             tri = []
             limit = LM_UV_LIMIT if lm_uv is not None else UV_LIMIT
             for corner in corners:
@@ -469,19 +702,45 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
                     stats['clamped_uv'] = stats.get('clamped_uv', 0) + 1
                     u, v = min(u, limit), min(v, limit)
                 n = _unit(n)
-                extra = tuple(_orthonormal(x, n) for x in corner[4:6])
+                extra = ()
+                if len(corner) > 4:
+                    # the game's tangent frame: the binormal along the UV map's V (Blender's bitangent), the
+                    # tangent always normal x binormal in game space. The game stores no handedness: its sbts-family
+                    # vertex shaders take the light and half vectors into the frame as (-L.T, -L.B, L.N), and every
+                    # tangent-framed vertex of the game's maps (Xbox and 2017 PC, st01-st09) has T = N x B, also
+                    # where the UVs are mirrored (there T = -dP/du). Blender's own tangent (+U) points the other way
+                    # on mirrored faces: the bump and highlight flipped there, hard seams on the pillars.
+                    b = _orthonormal(corner[5], n)
+                    extra = (_cross(n, b), b)
                 if lm_uv is not None:
                     extra += (tuple(min(1.0, max(0.0, x)) for x in corner[6]),)
-                key = (tuple(round(x, 4) for x in pos), tuple(round(x, 3) for x in n), (round(u, 5), round(v, 5)), c,
-                       tuple(tuple(round(x, 5) for x in e) for e in extra))
+                # the values as the vertex stores them (packed normals and tangents, UVs in 1/4096): corners that
+                # write the same bytes are one vertex
+                # write the same bytes are one vertex. The tangent frame is one per vertex, as in the game's files:
+                # the corners' binormals are summed and the frame made from the sum below (Blender's per-corner
+                # tangents differ slightly and split every vertex: st04's pillar 233 vertices -> 1014)
+                key = (tuple(round(x, 4) for x in pos), alr_build.pack_normal(n),
+                       (round(u * 4096), round(v * 4096)), c, len(extra) >= 2,
+                       tuple(tuple(round(x, 5) for x in e) for e in extra[2:]))
                 if key not in part['index']:
                     part['index'][key] = len(part['verts'])
                     part['verts'].append((pos, n, (u, v), c) + extra)
-                tri.append(part['index'][key])
+                    part.setdefault('bsum', []).append([0.0, 0.0, 0.0])
+                k = part['index'][key]
+                if len(extra) >= 2:
+                    bs = part['bsum'][k]
+                    for j in range(3):
+                        bs[j] += extra[1][j]
+                tri.append(k)
             if len(set(tri)) == 3:
                 part['tris'].append(tuple(tri) if flip else (tri[0], tri[2], tri[1]))   # mirror: see convert.py
         if tangents:
             me.free_tangents()
+        for part in parts.values():                       # one tangent frame per vertex, from the summed binormals
+            for k, vert in enumerate(part['verts']):
+                if len(vert) >= 6 and any(part['bsum'][k]):
+                    bn = _orthonormal(part['bsum'][k], vert[1])
+                    part['verts'][k] = vert[:4] + (_cross(vert[1], bn), bn) + vert[6:]
     finally:
         ev.to_mesh_clear()
     return parts
@@ -490,6 +749,10 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
 def _unit(v):
     l = math.sqrt(sum(x * x for x in v)) or 1.0
     return tuple(x / l for x in v)
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
 
 
 def _orthonormal(v, n):
@@ -528,13 +791,94 @@ def gather(context, vis_colls, scale, textures):
     depsgraph = context.evaluated_depsgraph_get()
     stats = dict(objects=0, clamped_uv=0)
     replace, seen = {}, set()
+    from . import townlights
+    town = townlights.town_lights(context.scene)   # the town: each draw names the lights linked to its object
+    joints = {}                                     # slot -> joint empties in skeleton order
+    for coll, slot in slot_of:
+        for ob in coll.objects:
+            if ob.type == 'EMPTY' and ob.get('pd_joint'):
+                joints.setdefault(slot, []).append(ob)
+    skel = {s: skeleton(js, scale) for s, js in joints.items()}
     for coll, slot in slot_of:
         for ob in coll.objects:
             if ob.type != 'MESH' or ob.name in seen:
                 continue
             seen.add(ob.name)
             stats['objects'] += 1
-            parts = mesh_parts(depsgraph, ob, ob.matrix_world, scale, textures, stats)
-            replace.setdefault(slot, []).extend(resolve(to_meshes(parts)))
+            sk = skel.get(slot)
+            node = 0
+            matrix = ob.matrix_world
+            if sk is not None:
+                # on its joint: the vertices in the joint's space (the game poses them with the joint's matrix)
+                node = sk['index'].get(ob.parent.name, sk['world']) if ob.parent is not None else sk['world']
+                if node != sk['world']:
+                    matrix = ob.parent.matrix_world.inverted() @ ob.matrix_world
+                sk['used'].add(node)
+            parts = mesh_parts(depsgraph, ob, matrix, scale, textures, stats)
+            meshes = resolve(to_meshes(parts, node))
+            lights = townlights.draw_lights(ob, town) if town else None
+            for m in meshes:
+                m['object'] = ob.name                    # which object made it (export keeps unedited game meshes)
+                if lights is not None:
+                    m['lights'] = lights
+            replace.setdefault(slot, []).extend(meshes)
     stats['triangles'] = sum(len(m['tris']) for ms in replace.values() for m in ms)
+    for slot, sk in skel.items():
+        if slot in replace:
+            for k in sk['used']:                     # computed flag: the joint has draws
+                sk['nodes'][k]['flags'] |= 0x0004
+            replace[slot] = dict(meshes=replace[slot], nodes=sk['nodes'])
+            stats['joints'] = stats.get('joints', 0) + len(sk['nodes'])
     return replace, stats
+
+
+def skeleton(empties, scale):
+    """Joint empties -> dict(nodes=[node_record kwargs], index={empty name: joint index}, world=joint index of an
+    identity root for meshes not on a joint, used=set()). Order: parents before children, roots and siblings by
+    name. Flags: the empty's game settings (pd_joint_lookup, pd_faces_camera, pd_hidden) and the computed bits
+    (translation / rotation / scale not identity; 'has draws' is added by gather)."""
+    from . import visuals
+    names = {o.name for o in empties}
+    kids = {}
+    for o in empties:
+        p = o.parent.name if o.parent is not None and o.parent.name in names else None
+        kids.setdefault(p, []).append(o)
+    order = []
+
+    def walk(p):
+        for o in sorted(kids.get(p, []), key=lambda o: cv.natural_key(o.name)):
+            order.append(o)
+            walk(o.name)
+    walk(None)
+    index = {o.name: k for k, o in enumerate(order)}
+    nodes = []
+    for o in order:
+        par = index.get(o.parent.name) if o.parent is not None and o.parent.name in names else None
+        local = o.matrix_basis if par is not None else o.matrix_world
+        loc, rot, scl = local.decompose()
+        t = cv.to_game(loc, scale)
+        r = cv.rot_to_game([list(row) for row in rot.to_matrix()])
+        s = (scl[0], scl[2], scl[1])
+        flags = 0
+        if any(abs(x) > 1e-6 for x in t):
+            flags |= 0x0010
+        if any(abs(x) > 1e-7 for x in r):
+            flags |= 0x0020
+        if any(abs(x - 1.0) > 1e-6 for x in s):
+            flags |= 0x0040
+        for bit, prop in visuals.JOINT_PROPS:
+            if o.get(prop):
+                flags |= bit
+        name = o.get('pd_joint_name') or ''
+        nodes.append(dict(t=t, rot=r, scale=s, flags=flags, parent=par,
+                          marker=alr_build.encode_word(name) if name else 0xFFFFFFFF))
+    world = 0
+    if not nodes or nodes[0]['parent'] is not None or nodes[0]['t'] != (0.0, 0.0, 0.0) or nodes[0]['flags'] & 0x70 \
+            or index.get(order[0].name) != 0:
+        world = 0
+        # an identity root first, for meshes on no joint (and the shadow volumes the writer adds on joint 0)
+        nodes = [dict(t=(0.0, 0.0, 0.0), rot=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0), flags=0, parent=None,
+                      marker=0xFFFFFFFF)] + [dict(n, parent=None if n['parent'] is None else n['parent'] + 1)
+                                             for n in nodes]
+        index = {k: v + 1 for k, v in index.items()}
+    return dict(nodes=nodes, index=index, world=world, used=set())

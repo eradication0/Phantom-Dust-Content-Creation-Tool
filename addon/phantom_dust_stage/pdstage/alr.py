@@ -100,6 +100,8 @@ def texture_dds(b, t):
         return None
     name = PIXEL_FORMATS.get(t['format'], (None,))[0]
     w, h, mips = t['width'], t['height'], max(1, t['mips'])
+    if name in ('B5G6R5', 'B5G5R5A1', 'B4G4R4A4'):
+        return _dds16(b, t, name, w, h, mips)
     fourcc = {'BC1': b'DXT1', 'BC2': b'DXT3', 'BC3': b'DXT5'}.get(name)
     if fourcc:
         block = PIXEL_FORMATS[t['format']][2]
@@ -114,7 +116,92 @@ def texture_dds(b, t):
     caps = 0x1000 | (0x400008 if mips > 1 else 0)
     hdr = struct.pack('<4s7I44x', b'DDS ', 124, flags, h, w, pitch, 0, mips) + pf + struct.pack('<4I4x', caps, 0, 0, 0)
     start = header(b)['resource_offset'] + t['offset']
-    return hdr + b[start:start + t['size']]
+    data = b[start:start + t['size']]
+    if not fourcc and not t['raw_format'] & 0x80 and not t['npot']:
+        # the original Xbox release: uncompressed textures are swizzled (format byte without the 0x80 the 2017
+        # release sets on its linear ones; its compressed textures are the same bytes in both releases)
+        data = unswizzle(data, w, h, mips, 4)
+    return hdr + data
+
+
+def texture_level_dds(b, t):
+    """Every mip level of a texture as its own one-level .dds file (bytes), level 0 first (texture_dds split up:
+    the game's lower levels are pictures of their own, pdstage/texlevels.py); [] when texture_dds can't read it."""
+    full = texture_dds(b, t)
+    if not full:
+        return []
+    fourcc = full[84:88]
+    block = {b'DXT1': 8, b'DXT3': 16, b'DXT5': 16}.get(fourcc)
+    data, pos, out = full[128:], 0, []
+    w, h = t['width'], t['height']
+    for _ in range(max(1, t['mips'])):
+        n = max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * block if block else w * h * 4
+        if pos + n > len(data):
+            break
+        hdr = bytearray(full[:128])
+        struct.pack_into('<3I', hdr, 12, h, w, n if block else w * 4)
+        struct.pack_into('<I', hdr, 28, 1)
+        struct.pack_into('<I', hdr, 108, 0x1000)
+        out.append(bytes(hdr) + data[pos:pos + n])
+        pos += n
+        w, h = max(1, w // 2), max(1, h // 2)
+    return out
+
+
+def _dds16(b, t, name, w, h, mips):
+    """A 16-bit texture (st01/st08's sky cloud colour cloud_color3 is R5G6B5) as a B8G8R8A8 .dds: each mip level
+    expanded to 8 bits per channel (the Xbox release's are swizzled: un-swizzled first)."""
+    from . import texlevels
+    start = header(b)['resource_offset'] + t['offset']
+    data = bytes(b[start:start + t['size']])
+    swz = not t['raw_format'] & 0x80 and not t['npot']
+    out, pos = bytearray(), 0
+    for lw, lh in texlevels.level_dims(w, h, mips):
+        if pos + 2 * lw * lh > len(data):
+            break
+        out += texlevels.decode_level(data[pos:pos + 2 * lw * lh], name.lower(), lw, lh, swz)[..., [2, 1, 0, 3]].tobytes()
+        pos += 2 * lw * lh
+    pf = struct.pack('<II4s5I', 32, 0x41, b'\0\0\0\0', 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
+    flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x8
+    caps = 0x1000 | (0x400008 if mips > 1 else 0)
+    hdr = struct.pack('<4s7I44x', b'DDS ', 124, flags, h, w, w * 4, 0, mips) + pf + struct.pack('<4I4x', caps, 0, 0, 0)
+    return hdr + bytes(out)
+
+
+def _morton(w, h):
+    """Swizzled position of every (x, y) of a power-of-two w x h texture: the bits of x and y interleaved from
+    the lowest (x first) while both have bits, then the larger side's remaining bits."""
+    import numpy as np
+    xs, ys = np.arange(w, dtype=np.int64), np.arange(h, dtype=np.int64)
+    ox, oy = np.zeros(w, dtype=np.int64), np.zeros(h, dtype=np.int64)
+    bit, i = 0, 0
+    while (1 << i) < max(w, h):
+        if (1 << i) < w:
+            ox |= ((xs >> i) & 1) << bit
+            bit += 1
+        if (1 << i) < h:
+            oy |= ((ys >> i) & 1) << bit
+            bit += 1
+        i += 1
+    return oy[:, None] + ox[None, :]
+
+
+def unswizzle(data, w, h, mips, bpp):
+    """Xbox swizzled texture data (mip levels one after another) -> linear rows."""
+    import numpy as np
+    out, pos = bytearray(), 0
+    for _ in range(max(1, mips)):
+        n = w * h * bpp
+        level = np.frombuffer(bytes(data[pos:pos + n]), dtype=np.uint8)
+        if len(level) < n:
+            out += data[pos:]
+            break
+        px = level.reshape(-1, bpp)
+        out += px[_morton(w, h).ravel()].tobytes()
+        pos += n
+        w, h = max(1, w // 2), max(1, h // 2)
+    out += data[pos:]
+    return bytes(out)
 
 
 def skeleton(b, root_off):
@@ -166,9 +253,9 @@ def _vertex_buffers(b, off):
     for i in range(n):
         e = off + 0xC + i * 0x1C
         fmt, vsize, vsize2, _u = struct.unpack_from('<4B', b, e)
-        count = struct.unpack_from('<I', b, e + 8)[0]
+        mask, count = struct.unpack_from('<2I', b, e + 4)
         rel = struct.unpack_from('<I', b, e + 0x14)[0]
-        out.append(dict(format=fmt, vertex_size=vsize, count=count, offset=rel))
+        out.append(dict(format=fmt, vertex_size=vsize, count=count, offset=rel, mask=mask))
     return out
 
 
@@ -229,9 +316,37 @@ def read_vertices(b, rb_off, vb):
 COLOUR_AT = {0x01: 0x14, 0x03: 0x14, 0x09: 0x10}
 
 
+def attribute_offsets(mask):
+    """{attribute bit: byte offset in the vertex} for a vertex-buffer attribute mask: bits 0-2 are the position
+    (12 bytes at 0), every other set bit adds 4 bytes in ascending bit order (clean-room notes on the ALR format,
+    "Vertex attributes": all 19 format / mask pairs of the game's files fit stride = 12 + 4 x bits)."""
+    out, off, bit = {}, 12, 8
+    while bit <= mask:
+        if mask & bit:
+            out[bit] = off
+            off += 4
+        bit <<= 1
+    return out
+
+
+def unpack_normal(w):
+    """A packed normal (11, 11, 10 signed bits: x, y, z), the inverse of alr_build.pack_normal."""
+    s = lambda v, bits: v - (1 << bits) if v & (1 << (bits - 1)) else v
+    return (s(w & 0x7FF, 11) / 1023.0, s((w >> 11) & 0x7FF, 11) / 1023.0, s((w >> 22) & 0x3FF, 10) / 511.0)
+
+
+def read_normals(b, rb_off, vb):
+    """Per-vertex normals (bit 0x08 of the buffer's mask), or None if the format has none."""
+    at = attribute_offsets(vb.get('mask', 0)).get(0x08)
+    if at is None:
+        return None
+    base, size = rb_off + vb['offset'] + at, vb['vertex_size']
+    return [unpack_normal(struct.unpack_from('<I', b, base + i * size)[0]) for i in range(vb['count'])]
+
+
 def read_colours(b, rb_off, vb):
-    """Per-vertex (r, g, b, a) bytes, or None if the format has no known colour."""
-    at = COLOUR_AT.get(vb['format'])
+    """Per-vertex (r, g, b, a) bytes (bit 0x80 of the buffer's mask), or None if the format has no colour."""
+    at = attribute_offsets(vb.get('mask', 0)).get(0x80, COLOUR_AT.get(vb['format']))
     if at is None:
         return None
     base, size = rb_off + vb['offset'] + at, vb['vertex_size']

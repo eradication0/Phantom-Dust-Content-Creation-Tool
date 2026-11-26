@@ -24,6 +24,17 @@ H_OBJECT_SOUNDS = 0xF8  # 16 bytes per object (8 x u16, FFFF = none): [1] its hi
 H_FILE_SIZE = 0x138      # equals the file size in every map
 
 
+def layout_kind(b):
+    """'stage' (the 0x13C-byte ST00 header of the battle maps and st09), 'short' (st00.dat: ST00 with a 0x28-byte
+    header and no tables; the game never loads it), 'area' (the town's st09_NN.dat, AR01..AR08) or None.
+    Only 'stage' files have the collision, spawn, object and effect tables read here."""
+    if bytes(b[:4]) == b'ST00':
+        return 'short' if len(b) >= 8 and struct.unpack_from('<I', b, 4)[0] == 0x28 else 'stage'
+    if bytes(b[:2]) == b'AR':
+        return 'area'
+    return None
+
+
 def header(b):
     if b[:4] != b'ST00':
         raise ValueError('not a stage .dat (no ST00 magic)')

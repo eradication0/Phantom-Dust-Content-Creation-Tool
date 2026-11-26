@@ -357,7 +357,7 @@ model_object('Bench_debris', join_meshes('Bench_debris', [
 
 # ---------------------------------------------------------------- effects: steam, sparks, smoke
 effects = collection('Effects', role='EFFECTS')
-for name, preset, spots in (('Steam', 'STEAM', [(-5, 5.2, FLOOR_Z), (5, -2.8, FLOOR_Z)]),
+for name, preset, spots in (('Steam', 'STEAM_PIPE', [(-5, 5.2, FLOOR_Z), (5, -2.8, FLOOR_Z)]),
                             ('Sparks', 'SPARKS', [(9.5, 9.5, FLOOR_Z + 2.5)]),
                             ('Smoke', 'SMOKE', [(-12, -12, FLOOR_Z)])):
     ec = collection(name, effects)
@@ -412,6 +412,5 @@ bpy.ops.wm.save_as_mainfile(filepath=blend)
 print('SAVED', blend)
 
 out = os.path.join(out_dir, game_original + '.dat')
-res = bpy.ops.export_scene.phantom_dust_stage(filepath=out, game_original=game_original, game_data=data,
-                                              background_and_sky=True)
+res = bpy.ops.export_scene.phantom_dust_stage(filepath=out, game_original=game_original, game_data=data)
 print('EXPORT', res, out)

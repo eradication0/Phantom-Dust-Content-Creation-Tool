@@ -61,10 +61,10 @@ SOCKETS = (
      'Colour and strength of the sun\'s shine. Black = none, like most of the game\'s own surfaces. The game '
      'uses dark to mid grey (about 0.1-0.5): full colours are very strong. In game the shine fills whole faces '
      'evenly (it is worked out per vertex), so curved or bevelled shapes show it best'),
-    ('Highlight', 'Shininess', 'NodeSocketFloat', 20.0, 1.0, 127.0,
+    ('Highlight', 'Shininess', 'NodeSocketFloat', 20.0, 0.0, 127.0,
      'How exactly a face must face the sun\'s reflection to shine (the game\'s specular power): low = most '
      'sunlit faces glow, high = only faces at the right angle. Not a spot size: a face shines evenly. '
-     'The game uses 2-80'),
+     'The game uses 2-80 (0 on surfaces without a highlight colour, and on one st08 sky layer)'),
     ('Highlight', 'Shine Mask', 'NodeSocketFloat', 1.0, 0.0, 1.0,
      'Where the shine and reflection show: a value for the whole material, or link a Color Attribute '
      '(Paint Shine Mask) to paint it. Stored as the vertex colour\'s alpha'),
@@ -840,8 +840,11 @@ def scrolling(mat):
     if not on:
         return dict(scroll=False)
     speeds = tuple(int(v) for p in SCROLL_PROPS for v in getattr(mat, p))
+    # the game's own cloud material (imported): its normal maps' alpha is part of the cloud's alpha (the shader's
+    # "overlay" of the colour and both normal alphas) and is kept as the images hold it
     return dict(scroll=True, scroll_speeds=speeds, scroll_blend=mat.pd_scroll_blend,
-                normal_b=getattr(mat, 'pd_scroll_normal_b_image', None))
+                normal_b=getattr(mat, 'pd_scroll_normal_b_image', None),
+                scroll_keep_normal_alpha=mat.get('pd_game_shader') == 'sbtscloud3')
 
 
 def apply_scroll(mat):

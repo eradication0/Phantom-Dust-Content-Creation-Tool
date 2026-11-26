@@ -5,7 +5,8 @@ An animation is a chain of node blocks, ended by u32 0, u32 8:
     u32 5, u32 block size (bytes, header included)
     f32 last frame, u16 node, u16 8, u32 translation keys, u32 rotation keys, f32 0, u16 0, u16 16
     translation keys: f32 frame, f32 x, y, z      (the node's position in the object's own game space)
-    rotation keys:    u16 frame, i16 x, y, z      (unit quaternion times 32767, w = +sqrt(1 - x2 - y2 - z2))
+    rotation keys:    u16 frame, i16 x, y, z      (NOT a quaternion: Euler angles, pi/16384 per unit; see
+                                                   pdstage/motion.py, which the export now uses)
 
 Storm Refinery's container (one block, node 0, 269 / 220 keys) and Spiral Highway's iron roads (a block per
 piece, 90 keys each) play theirs when they break. Frames are the game's frames.

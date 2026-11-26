@@ -409,16 +409,66 @@ def _style_colliders_handler(*_args):
         pass
 
 
+@bpy.app.handlers.persistent
+def _mip_levels_before_save(*_args):
+    """Saving packs painted images again (they are no longer "dirty" afterwards): a game texture painted in this
+    session gets its lower mip levels made from the painted picture first, so the saved file stays consistent
+    (visuals_export.stored_mip_levels)."""
+    try:
+        for img in bpy.data.images:
+            if img.get('pd_mip_image') is not None and img.is_dirty:
+                vx.regenerate_mip_image(img)
+    except Exception:                     # never block a save
+        pass
+
+
+class PDSTAGE_OT_regenerate_mips(bpy.types.Operator):
+    """Make this game texture's lower mip levels (the pictures the game shows at a distance, the image
+    "<name> mips") again from the texture itself. Without it, an imported texture keeps the game's own lower levels
+    until it is painted, replaced or resized"""
+    bl_idname = 'pdstage.regenerate_mips'
+    bl_label = 'Regenerate Mip Levels'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    all_images: BoolProperty(name='All Textures', default=False,
+                             description='Every imported texture, not only the one shown')
+
+    def execute(self, context):
+        img = getattr(getattr(context, 'space_data', None), 'image', None)
+        imgs = [i for i in bpy.data.images if i.get('pd_mip_image') is not None] if self.all_images or img is None             else [img]
+        n = sum(1 for i in imgs if vx.regenerate_mip_image(i))
+        self.report({'INFO'}, '%d textures: lower mip levels made from the top level' % n)
+        return {'FINISHED'} if n else {'CANCELLED'}
+
+
+def _image_menu(self, _context):
+    self.layout.separator()
+    self.layout.operator(PDSTAGE_OT_regenerate_mips.bl_idname)
+
+
 def register_handlers():
     for h in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_post):
         if _style_colliders_handler not in h:
             h.append(_style_colliders_handler)
+    if _mip_levels_before_save not in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.append(_mip_levels_before_save)
+    try:
+        bpy.types.IMAGE_MT_image.remove(_image_menu)
+    except Exception:
+        pass
+    bpy.types.IMAGE_MT_image.append(_image_menu)
 
 
 def unregister_handlers():
     for h in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_post):
         if _style_colliders_handler in h:
             h.remove(_style_colliders_handler)
+    if _mip_levels_before_save in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.remove(_mip_levels_before_save)
+    try:
+        bpy.types.IMAGE_MT_image.remove(_image_menu)
+    except Exception:
+        pass
 
 
 class PDSTAGE_OT_toggle_broken_parts(bpy.types.Operator):
@@ -596,4 +646,5 @@ class PDSTAGE_PT_sidebar(bpy.types.Panel):
 
 
 classes = (PDSTAGE_OT_new_map, PDSTAGE_OT_spawn_example, PDSTAGE_OT_toggle_broken_parts, PDSTAGE_OT_restore,
+           PDSTAGE_OT_regenerate_mips,
            PDSTAGE_PT_sidebar)

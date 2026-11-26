@@ -169,23 +169,118 @@ def set_point(script, light_set, slot, rng, pos, colour):
     script['calls'].append((SET_POINT, args))
 
 
+COLOUR_ARGS = {SET_LIGHT: (6, 7, 8), SET_FOG: (2,), SET_POINT: (4,)}
+
+
+def _same_kind(cid, old, args):
+    """args with each value written the way the old call wrote it (a whole number the game's script has as a short
+    integer stays one, an unchanged value keeps its own encoding): the script keeps its length, so it can be
+    written over the old one (write)."""
+    out = []
+    for k, a in enumerate(args):
+        o = old[k] if k < len(old) else None
+        if o is None:
+            out.append(a)
+        elif k in COLOUR_ARGS.get(cid, ()):
+            out.append(o if o[1] == a[1] else (('i', a[1]) if o[0] == 'i' and a[1] < 0x10000 else a))
+        else:
+            new_v = float(a[1]) if a[0] == 'i' else u2f(a[1])
+            old_v = float(o[1]) if o[0] == 'i' else u2f(o[1])
+            if new_v == old_v:
+                out.append(o)
+            elif o[0] == 'i' and new_v.is_integer() and 0 <= new_v < 0x10000:
+                out.append(('i', int(new_v)))
+            else:
+                out.append(a)
+    return out
+
+
 def _replace(script, cid, light_set, set_arg, args):
     for i, (c, a) in enumerate(script['calls']):
         if c == cid and len(a) > set_arg and a[set_arg] == ('i', light_set):
-            script['calls'][i] = (cid, args)
+            script['calls'][i] = (cid, _same_kind(cid, a, args))
             return
     raise ValueError('light set %d has no %04x call' % (light_set, cid))
 
 
 def write(dat_bytes, script):
-    """Append the script to the .dat and point every map-light slot that was in use at it."""
+    """Put the script in the .dat: over the one there when every map-light slot in use points at that one and the
+    new script has its length (a changed colour or direction: only those words change), else appended, every
+    map-light slot that was in use pointed at it."""
     b = bytearray(dat_bytes)
+    new = build(script)
+    used = {struct.unpack_from('<I', b, H_SCRIPT + 4 * v)[0] for v in range(VARIANT_SLOTS)} - {0xFFFFFFFF}
+    if len(used) == 1:
+        off = used.pop()
+        if off + 8 <= len(b) and off + struct.unpack_from('<I', b, off + 4)[0] + 12 == off + len(new) <= len(b):
+            b[off:off + len(new)] = new
+            return bytes(b)
     while len(b) % 4:
         b.append(0)
     off = len(b)
-    b += build(script)
+    b += new
     used = [v for v in range(VARIANT_SLOTS) if struct.unpack_from('<I', b, H_SCRIPT + 4 * v)[0] != 0xFFFFFFFF]
     for v in used or [0]:
         struct.pack_into('<I', b, H_SCRIPT + 4 * v, off)
     struct.pack_into('<I', b, 0x138, len(b))
     return bytes(b)
+
+
+# ---- a whole script from values ---------------------------------------------------------------------------------
+
+SSB_ID_BASE = 1788801600       # header word 0x18 of the game's scripts: st01 ... st09 = base + 1600 * n (no reader
+                               # of the word was found in the script VM: docs "ssb")
+MAPLIGHT_NAME = (2385059977, 1920000000)   # the function table's one entry, "maplight" (two base-40 words)
+
+
+def encode_num(x):
+    """A number argument as the game's scripts hold it: 0 as a short integer, anything else as a float."""
+    return ('i', 0) if x == 0.0 else ('f', f2u(float(x)))
+
+
+def encode_colour(rgb):
+    """A colour (r, g, b bytes) as the game's scripts hold it: below 0x10000 a short integer, else 32 bits."""
+    r, g, b = (max(0, min(255, int(round(c)))) for c in rgb)
+    v = r << 16 | g << 8 | b
+    return ('i', v) if v < 0x10000 else ('f', v)
+
+
+def script_from(sets, colour, scale, scale_colour, stage_number):
+    """The 22-call script from values. sets: 4 dicts (axis, direction, diffuse, diffuse2, ambient, fog_mode, fog_a
+    (end for linear fog, density else), fog_start, fog_colour, points: 3 x None or dict(range, pos, colour))."""
+    calls = []
+    for i, s in enumerate(sets):
+        calls.append((SET_LIGHT, [encode_num(x) for x in s['axis']] + [encode_num(x) for x in s['direction']]
+                      + [encode_colour(s['diffuse']), encode_colour(s['diffuse2']), encode_colour(s['ambient']),
+                         ('i', i)]))
+        calls.append((SET_FOG, [encode_num(s['fog_a']), encode_num(s['fog_start']), encode_colour(s['fog_colour']),
+                                ('i', int(s['fog_mode'])), ('i', i)]))
+        for k in range(3):
+            p = s['points'][k] or dict(range=0.0, pos=(0.0, 0.0, 0.0), colour=(0, 0, 0))
+            calls.append((SET_POINT, [encode_num(p['range'])] + [encode_num(x) for x in p['pos']]
+                          + [encode_colour(p['colour']), ('i', k), ('i', i)]))
+    calls.append((GLOBAL_COLOUR, [('i', 0), encode_colour(colour)]))
+    calls.append((GLOBAL_SCALE, [encode_num(scale), encode_colour(scale_colour)]))
+    header = struct.pack('<8I', 0x20, 0, 0, 0, 0, 0xFFFFFFFF, SSB_ID_BASE + 1600 * int(stage_number), 0)
+    return dict(header=header, name=MAPLIGHT_NAME, calls=calls)
+
+
+def values_of(script):
+    """The script's values in script_from's form: (sets, colour, scale, scale_colour)."""
+    d = describe(script)
+    sets = []
+    for s in d['sets']:
+        mode = s.get('fog_mode', 0)
+        sets.append(dict(axis=s.get('axis', (0.0, 1.0, 0.0)), direction=s.get('direction', (0.0, -1.0, 0.0)),
+                         diffuse=s.get('diffuse', (0, 0, 0)), diffuse2=s.get('diffuse2', (0, 0, 0)),
+                         ambient=s.get('ambient', (0, 0, 0)), fog_mode=mode,
+                         fog_a=s.get('fog_end' if mode == FOG_LINEAR else 'fog_density', 0.0),
+                         fog_start=s.get('fog_start', 0.0), fog_colour=s.get('fog_colour', (0, 0, 0)),
+                         points=list(s['points'])))
+    colour, scale, scale_colour = (0, 0, 0), 1.0, (0, 0, 0)
+    for cid, args in script['calls']:
+        if cid == GLOBAL_COLOUR and len(args) == 2:
+            colour = _colour(args[1])
+        elif cid == GLOBAL_SCALE and len(args) == 2:
+            scale, scale_colour = _num(args[0]), _colour(args[1])
+    return sets, colour, scale, scale_colour
