@@ -250,7 +250,9 @@ def spawns_and_orbs(scene):
 
 def _spawn_matrix(ob, unit):
     loc, rot, _scale = ob.matrix_world.decompose()
-    return Matrix.Translation(loc) @ rot.to_matrix().to_4x4() @ Matrix.Scale(unit, 4) @ GAME_TO_BLENDER
+    # the player model faces game -z; turned half a turn so it looks along the spawn's +Y (its in-game facing)
+    return (Matrix.Translation(loc) @ rot.to_matrix().to_4x4() @ Matrix.Rotation(math.pi, 4, 'Z')
+            @ Matrix.Scale(unit, 4) @ GAME_TO_BLENDER)
 
 
 def _draw():

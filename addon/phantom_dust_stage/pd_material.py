@@ -502,16 +502,16 @@ def register_props():
     vec = dict(size=2, default=(0, 0), min=-32768, max=32767, soft_min=-3000, soft_max=3000,
                update=_scroll_changed)
     bpy.types.Material.pd_scroll_colour = bpy.props.IntVectorProperty(
-        name='Colour Speed', description='X / Y scroll speed of the colour texture (150 = a slow drift as the '
+        name='Diffuse Speed', description='X / Y scroll speed of the Diffuse texture (150 = a slow drift as the '
                                          'sky\'s clouds, 600 = clearly moving, 0 = still)', **vec)
     bpy.types.Material.pd_scroll_normal_a = bpy.props.IntVectorProperty(
-        name='Normal A Speed', description='X / Y scroll speed of the normal map', **vec)
+        name='Normal Map Speed', description='X / Y scroll speed of the Normal Map texture', **vec)
     bpy.types.Material.pd_scroll_normal_b = bpy.props.IntVectorProperty(
-        name='Normal B Speed', description='X / Y scroll speed of the second normal map (added on top of the '
+        name='Normal Map 2 Speed', description='X / Y scroll speed of Normal Map 2, the texture picked below (added on top of the '
                                            'first: two layers moving apart make water ripple)', **vec)
     bpy.types.Material.pd_scroll_normal_b_image = bpy.props.PointerProperty(
-        type=bpy.types.Image, name='Normal Map B',
-        description='The second normal map; none: the first one again (at its own speed)')
+        type=bpy.types.Image, name='Normal Map 2',
+        description='The second normal map; none: the Normal Map again (at its own speed)')
     bpy.types.Material.pd_scroll_blend = bpy.props.EnumProperty(
         name='Draw', items=SCROLL_BLENDS, default='OPAQUE', update=_scroll_changed,
         description='How the scrolling surface is drawn')
@@ -638,6 +638,9 @@ def setup(mat, diffuse=None, normal=None, reflection=None, specular=(0.0, 0.0, 0
 
 ALPHA_NODE = 'PD Alpha'
 ALPHA_SCALE_NODE = 'PD Alpha Scale'
+ADD_NODE = 'PD Glow Add'
+ADD_NONE_NODE = 'PD Glow None'
+ADD_CLEAR_NODE = 'PD Alpha Clear'
 
 
 def alpha_kind(img):
@@ -681,9 +684,10 @@ def apply_alpha(mat, img=None):
         nt.nodes.remove(old)
         if tr is not None:
             nt.nodes.remove(tr)
-    old = nt.nodes.get(ALPHA_SCALE_NODE)
-    if old is not None:
-        nt.nodes.remove(old)
+    for name in (ALPHA_SCALE_NODE, ADD_NODE, ADD_NONE_NODE, ADD_CLEAR_NODE):
+        old = nt.nodes.get(name)
+        if old is not None:
+            nt.nodes.remove(old)
     out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
     tex = image_node(mat, 'Diffuse')
     img = img if img is not None else (tex.image if tex is not None else None)
@@ -695,6 +699,7 @@ def apply_alpha(mat, img=None):
         nt.links.new(g.outputs['Shader'], out.inputs['Surface']) if out is not None else None
         return
     tr = nt.nodes.new('ShaderNodeBsdfTransparent')
+    tr.name = tr.label = ADD_CLEAR_NODE
     tr.location = (g.location.x + 300, g.location.y + 150)
     mx = nt.nodes.new('ShaderNodeMixShader')
     mx.name = mx.label = ALPHA_NODE
@@ -712,9 +717,26 @@ def apply_alpha(mat, img=None):
         nt.links.new(sc.outputs['Value'], mx.inputs['Fac'])
     else:
         nt.links.new(tex.outputs['Alpha'], mx.inputs['Fac'])
-    nt.links.new(tr.outputs['BSDF'], mx.inputs[1])
     nt.links.new(g.outputs['Shader'], mx.inputs[2])
-    nt.links.new(mx.outputs['Shader'], out.inputs['Surface'])
+    if getattr(mat, 'pd_scroll', False) and mat.pd_scroll_blend == 'ADD':
+        # Glow as the game draws it (src x alpha + what is behind): the surface x alpha, added to a clear surface
+        none = nt.nodes.new('ShaderNodeEmission')
+        none.name = none.label = ADD_NONE_NODE
+        none.inputs['Strength'].default_value = 0.0
+        none.location = (g.location.x + 120, g.location.y + 150)
+        nt.links.new(none.outputs['Emission'], mx.inputs[1])
+        add = nt.nodes.new('ShaderNodeAddShader')
+        add.name = add.label = ADD_NODE
+        add.location = (g.location.x + 420, g.location.y + 50)
+        tr.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+        nt.links.new(tr.outputs['BSDF'], add.inputs[0])
+        nt.links.new(mx.outputs['Shader'], add.inputs[1])
+        nt.links.new(add.outputs['Shader'], out.inputs['Surface'])
+        out.location = (g.location.x + 640, g.location.y)
+        kind = 'BLEND'
+    else:
+        nt.links.new(tr.outputs['BSDF'], mx.inputs[1])
+        nt.links.new(mx.outputs['Shader'], out.inputs['Surface'])
     for attr, val in (('surface_render_method', 'BLENDED' if kind == 'BLEND' else 'DITHERED'),
                       ('blend_method', 'BLEND' if kind == 'BLEND' else 'CLIP')):
         try:
@@ -1248,12 +1270,12 @@ class PDSTAGE_PT_material(bpy.types.Panel):
             if mat.pd_scroll_blend == 'ALPHA':
                 col.prop(mat, 'pd_transparency', text='Transparency', slider=True)
             col = box.column(align=True)
-            col.prop(mat, 'pd_scroll_colour', text='Colour X / Y')
-            col.prop(mat, 'pd_scroll_normal_a', text='Normal A X / Y')
-            col.prop(mat, 'pd_scroll_normal_b', text='Normal B X / Y')
+            col.prop(mat, 'pd_scroll_colour', text='Diffuse X / Y')
+            col.prop(mat, 'pd_scroll_normal_a', text='Normal Map X / Y')
+            col.prop(mat, 'pd_scroll_normal_b', text='Normal Map 2 X / Y')
             col.template_ID(mat, 'pd_scroll_normal_b_image', open='image.open')
             if mat.pd_scroll_normal_b_image is None:
-                col.label(text='Normal B: the normal map again', icon='INFO')
+                col.label(text='Normal Map 2: none, uses the Normal Map', icon='INFO')
             box.label(text='150 = slow drift, 600 = moving; press Play to preview', icon='INFO')
             box.label(text='No light map, reflection or highlight here', icon='INFO')
         draw_preview_toggle(lay, context)
