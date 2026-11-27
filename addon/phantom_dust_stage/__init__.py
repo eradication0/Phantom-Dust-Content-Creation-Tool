@@ -14,7 +14,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import convert as cv
-from . import characters_ui, exporter, guides, importer, lightbake, pd_material, realtime, restricted, scene_tools, sky, surfaces
+from . import characters_ui, exporter, guides, importer, lightbake, navmesh, pd_material, release, realtime, restricted, scene_tools, sky, surfaces
 from ._lib import effects_build, objects_build
 from .objects_import import part_kind
 
@@ -44,8 +44,15 @@ class PDSTAGE_Preferences(bpy.types.AddonPreferences):
         name='Game data folder', subtype='DIR_PATH',
         description="Phantom Dust's Assets\\Data folder (contains Map\\st04.dat and so on)")
 
+    github_token: StringProperty(
+        name='GitHub token', subtype='PASSWORD',
+        description='For Release > Publish to GitHub: a fine-grained personal access token with "Contents: read and '
+                    'write" on your mod repositories (github.com > Settings > Developer settings). Saved in Blender\'s '
+                    'preferences on this computer. Empty: the GH_TOKEN / GITHUB_TOKEN environment variable')
+
     def draw(self, context):
         self.layout.prop(self, 'game_data')
+        self.layout.prop(self, 'github_token')
 
 
 def _prefs_game_data(context):
@@ -186,8 +193,19 @@ class PDSTAGE_OT_export(bpy.types.Operator, ExportHelper):
                                         game_data)
             if vmsg:
                 msg += '; ' + vmsg + ' -> ' + os.path.basename(out_alr)
+            try:
+                cad_path, nmsg = navmesh.export(context.scene, self.scale, self.filepath)
+            except ValueError as e:
+                raise exporter.ExportError(str(e))
+            msg += '; ' + nmsg
             if self.install_to_game:
                 done = exporter.install(game_data, self.game_original, self.filepath, out_alr if vmsg else None)
+                if cad_path:
+                    nav_done = navmesh.install(game_data, self.game_original, cad_path)
+                    done += nav_done
+                    if nav_done and navmesh.stage_number(self.game_original) % 10 in (2, 3, 4, 5, 6, 7, 8):
+                        n = navmesh.stage_number(self.game_original) % 10
+                        msg += ('; note: st%02d, st1%d and st2%d share one nav mesh file' % (n, n, n))
                 msg += '; installed into the game as %s' % ', '.join(os.path.basename(p) for p in done)
         except (exporter.ExportError, OSError) as e:
             self.report({'ERROR'}, str(e))
@@ -260,7 +278,7 @@ class PDSTAGE_PT_collection(bpy.types.Panel):
                 col.label(text='stay_...   broken piece that stays where it is', icon='BLANK1')
             if 'D' in states:
                 col.label(text='debris_... what is left after breaking', icon='BLANK1')
-            col.label(text='collider_... collision (default: a box)', icon='BLANK1')
+            col.label(text='collider_... collision (default: its own mesh)', icon='BLANK1')
             if destructible:
                 col.label(text='collider_broken_... collision once broken', icon='BLANK1')
                 col.label(text="A piece's own children (shadow) move with it.", icon='BLANK1')
@@ -281,6 +299,8 @@ class PDSTAGE_PT_collection(bpy.types.Panel):
             lay.label(text='Each child collection is one object type')
         elif c.pd_role == 'EFFECTS':
             lay.label(text='Each child collection is one effect type (steam, sparks, smoke)')
+        elif c.pd_role == 'NAVMESH':
+            lay.label(text='AI paths: NavMesh quads, NavLinks, JumpPoint empties (drawn pink)')
 
 
 class PDSTAGE_PT_lighting(bpy.types.Panel):
@@ -565,6 +585,8 @@ def register():
         guides.register()
     except Exception as e:                          # a viewport convenience: never block the add-on
         print('Phantom Dust Stage: scale guides not started:', e)
+    navmesh.register()
+    release.register()
     try:
         scene_tools.register_handlers()
     except Exception as e:
@@ -593,6 +615,14 @@ def unregister():
     pd_material.unregister_props()
     try:
         guides.unregister()
+    except Exception:
+        pass
+    try:
+        navmesh.unregister()
+    except Exception:
+        pass
+    try:
+        release.unregister()
     except Exception:
         pass
     for menu, fn in ((bpy.types.TOPBAR_MT_file_export, menu_export), (bpy.types.TOPBAR_MT_file_import, menu_import)):

@@ -9,7 +9,7 @@
                           with the collection's settings; the mesh around its own origin is the intact model.
       Broken...           optional child collection: each mesh is one piece of the broken model
       Debris...           optional child collection: the debris model
-      Collider...         optional child collection: the collision shape (default: a box around the model)
+      Collider...         optional child collection: the collision shape (default: the placement's own mesh)
   Broken, Debris and Collider meshes are modelled around the world origin (= the object's own origin) at scale 1;
   a scaled placement scales them with it.
 """
@@ -238,7 +238,7 @@ def _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats):
         no_model = True                                     # an invisible trigger: the mesh only sets its shape
     intact = [] if no_model else resolve(to_meshes(mesh_parts(depsgraph, insts[0], size, scale, textures, stats)))
     models = [None if no_model else
-              dict(meshes=intact, nodes=[dict(flags=0x0004, values=_root_values(
+              dict(meshes=list(intact), nodes=[dict(flags=0x0004, values=_root_values(
                   insts, 0, (0, 0, hits if hits > 1 else 0, 0)))]),
               None, None]
 
@@ -337,7 +337,11 @@ def _object_type(depsgraph, tc, name, insts, sc, scale, textures, stats):
         collision = _collider_tris(depsgraph, [(insts[0], size)] + parts('collider'), scale, surface)
     else:
         collision = _collider_tris(depsgraph, parts('collider'), scale, surface)
-    if not collision and intact and not any(o.get('pd_no_collider') for o in insts):   # default: a box
+    if not collision and not no_model and not any(o.get('pd_no_collider') for o in insts):
+        # no collider_ part: the object's own mesh is its collider (its placement scale built in, as the model)
+        collision = _collider_tris(depsgraph, [(insts[0], size)], scale, surface)
+    if not collision and intact and not any(o.get('pd_no_collider') for o in insts):   # last resort: a box
+        # around the visible model only (the shadow volumes, which reach far along the light, stay out)
         pts = [v[0] for m in intact for v in m['verts']]
         lo = tuple(min(p[k] for p in pts) for k in range(3))
         hi = tuple(max(p[k] for p in pts) for k in range(3))

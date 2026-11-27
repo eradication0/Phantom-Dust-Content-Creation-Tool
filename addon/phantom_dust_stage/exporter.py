@@ -451,7 +451,7 @@ def gather_collision(context, scale):
 
 
 RESOURCE_LIMIT = 20 * 1024 * 1024   # the game loads a model file's vertex + texture data into 20 MiB (see export_models)
-COLLISION_GUIDE = 10000  # collision triangles: the game's maps use 2,700-9,300; a 52k one crashed on load
+COLLISION_GUIDE = 40000  # collision triangles: the game's maps use 2,700-9,300; custom maps to 12k loaded, a 52k one crashed
 CARRIED_MODELS = {}      # (home map, MD00 slot) -> (new .alr root, model name), from the last export_models
 
 

@@ -26,6 +26,20 @@ files (`stNN.dat` and `stNN.alr`) and can install them for you.
 
 Skill animations/projectiles are planned later.
 
+## What's new in 1.4
+
+- **Round-trip rebuild**: a game map imported and exported again is built entirely from the Blender scene and comes
+  back equal to the original (all 37 stage files tested); see `ROUNDTRIP_FIXES.md` and `FIELD_MAP.md`.
+- **AI Nav Mesh** (`com/stNN/comdataV.cad`): imported with maps into a Nav_Mesh collection (drawn pink), exported and
+  installed with the map, and **Generate Nav Mesh** builds one from the collision for maps that have none.
+- **Release** panel: preview.png, the mod-info.ini fields and the map file name; **Build Release Zip** packs the map
+  as a Rebirth mod release, **Publish to GitHub** makes the release (GitHub token in the add-on preferences).
+- Limits in the Map panel: destructibles, placed objects, nav mesh; the collision guide is 40k triangles.
+- Destructibles without a `collider_` part use their own mesh as the collider (the old default box also took in the
+  shadow volume and came out too big).
+- Scrolling textures: speeds named after the material slots (Diffuse, Normal Map, Normal Map 2); Glow drawn
+  additively in Blender. The scale guide's dummy faces the spawn direction.
+
 ## What's new in 1.3
 
 - **Transparent** checkbox and **Transparency** slider on the Phantom Dust material (the game's see-through
@@ -136,7 +150,7 @@ Model the object around the world origin. On the type collection:
   (each mesh is one piece) and `Debris`. Debris speed is set by the game from the piece's size (lighter pieces
   fly faster, up to a fixed limit).
 - Jump pads: **Jump power** (the game's pads use 100-250; 200 launches a player about twice a 6 m wall).
-- Optional child collection `Collider` (default: a box around the model).
+- Optional child collection `Collider`, or `collider_` child objects (default: the placement's own mesh).
 
 **Effects**: an Effects collection holds one child collection per effect type (**Effect**: Steam, Sparks,
 Smoke). Every object in it (empties work well) is one placement: location, turn about Z, and scale.

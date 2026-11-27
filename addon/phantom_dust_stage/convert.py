@@ -38,6 +38,8 @@ ROLES = [
                            'every object directly in it is one placement'),
     ('LIGHTING', 'Lighting', 'The sun and lamps Bake Lighting uses (not exported themselves)'),
     ('SHADOWS', 'Shadow Casters', 'Closed meshes that cast the real-time character shadows in game (not drawn)'),
+    ('NAVMESH', 'Nav Mesh', 'The AI navigation mesh (com/stNN/comdataV.cad): quads the computer players walk on, '
+                           'the links between them and jump pad landings'),
 ]
 
 

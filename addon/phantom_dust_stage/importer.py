@@ -153,6 +153,16 @@ def import_stage(context, path, scale=cv.DEFAULT_SCALE, collision=True, spawns=T
             # Town_Lights collection made with the visuals, whose light linking gives the draws their lists
             report.append(stage_extras.import_enter_lights(context, b, root, scale, stage))
 
+    if dat.layout_kind(b) == 'stage' and stage:
+        from . import navmesh
+        data_dir = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+        if os.path.basename(data_dir).lower() == 'map':       # imported from the add-on's backup folder
+            data_dir = os.path.dirname(data_dir)
+        try:
+            report.append(navmesh.import_for_stage(context, root, data_dir, stage, scale, variant))
+        except (OSError, ValueError) as e:
+            report.append('nav mesh skipped: %s' % e)
+
     if game_sky:
         context.scene.pd_sky_custom = False                # the dome is the Sky collection's meshes
         report.append('sky: the game\'s dome as meshes (Visuals > Sky)')

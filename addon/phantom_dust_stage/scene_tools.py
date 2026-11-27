@@ -512,6 +512,32 @@ def _triangle_count(objects):
     return total
 
 
+# Objects: the game keeps the placement count as a 16-bit number and allocates the objects for it (no fixed table
+# found). No hard limit is known; these are the most any game map uses (Lost Palace: 152 breakables in one layout,
+# Storm Refinery: 269 placements). Above them it is untested.
+DESTRUCTIBLE_GUIDE = 152
+PLACEMENT_GUIDE = 269
+
+
+def object_counts(scene):
+    """(placed objects, destructible ones) in the Objects collections, counted once per object."""
+    from .objects_import import part_kind
+    from ._lib import objects_build
+    placed = breakable = 0
+    for oc in exporter.collections_with_role(scene, 'OBJECTS'):
+        for tc in oc.children:
+            preset = getattr(tc, 'pd_preset', 'SOLID')
+            cat = objects_build.PRESETS.get(preset, (1,))[0]
+            for o in tc.objects:                      # as objects_export._groups picks placements
+                if o.type != 'MESH' or part_kind(o) or (o.parent is not None and (part_kind(o.parent)
+                                                                                   or o.parent.get('pd_part'))):
+                    continue
+                placed += 1
+                c = tuple(o['pd_class'])[0] if o.get('pd_class') else cat
+                breakable += 1 if c == 2 else 0
+    return placed, breakable
+
+
 def collider_meshes(scene):
     """Every mesh exported as collision: the Colliders collections and Visuals marked Collide."""
     seen, out = set(), []
@@ -561,6 +587,8 @@ class PDSTAGE_OT_restore(bpy.types.Operator):
             return {'CANCELLED'}
         try:
             done = exporter.restore(game_data, self.game_original)
+            from . import navmesh
+            done += navmesh.restore(game_data, self.game_original)
         except OSError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
@@ -616,6 +644,8 @@ class PDSTAGE_PT_sidebar(bpy.types.Panel):
             row.operator('pdstage.sky_preview_clear', text='', icon='X')
         else:
             row.operator('pdstage.sky_preview', text='Add Custom Sky', icon='WORLD')
+        from . import navmesh
+        navmesh.draw_settings(lay, context)
         col = lay.column(align=True)
         col.label(text='3. Export')
         col.prop(s, 'pd_game_original', text='Replaces')
@@ -643,6 +673,22 @@ class PDSTAGE_PT_sidebar(bpy.types.Panel):
         if ctris > exporter.COLLISION_GUIDE:
             box.label(text='Too much collision can crash the', icon='BLANK1')
             box.label(text='game on load: use simpler colliders', icon='BLANK1')
+        placed, breakable = object_counts(s)
+        box.label(text='Destructibles: {:,} / {:,}'.format(breakable, DESTRUCTIBLE_GUIDE),
+                  icon='ERROR' if breakable > DESTRUCTIBLE_GUIDE else 'MOD_EXPLODE')
+        box.label(text='Placed objects: {:,} / {:,}'.format(placed, PLACEMENT_GUIDE),
+                  icon='ERROR' if placed > PLACEMENT_GUIDE else 'BLANK1')
+        if breakable > DESTRUCTIBLE_GUIDE or placed > PLACEMENT_GUIDE:
+            box.label(text='More than any game map: untested', icon='BLANK1')
+        from . import navmesh
+        from ._lib import cad
+        nc = navmesh.counts(s)
+        if nc is None:
+            box.label(text='Nav mesh: none (game original kept)', icon='DOT')
+        else:
+            for label, n, cap in (('Nav quads', nc[0], cad.MAX_POLYS), ('Nav links', nc[1], cad.MAX_LINKS),
+                                  ('Jump points', nc[3], cad.MAX_JUMP), ('Nav points', nc[2], cad.MAX_NAV)):
+                box.label(text='%s: %d / %d' % (label, n, cap), icon='ERROR' if n > cap else 'BLANK1')
 
 
 classes = (PDSTAGE_OT_new_map, PDSTAGE_OT_spawn_example, PDSTAGE_OT_toggle_broken_parts, PDSTAGE_OT_restore,
