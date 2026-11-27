@@ -347,9 +347,98 @@ def _lit_copy(ob, i, m, light):
     uv.uv_map = UV_NAME
     uv.location = (tex.location.x - 250, tex.location.y)
     nt.links.new(uv.outputs['UV'], tex.inputs['Vector'])
+    if keeps_detail(m) and write_shade(ob, bpy.context.scene):
+        # normal map / shine: the material's own look, the bake as shade (as exported: keeps_detail)
+        nt.nodes.remove(tex)
+        nt.nodes.remove(uv)
+        attr = nt.nodes.new('ShaderNodeVertexColor')
+        attr.layer_name = SHADE_LAYER
+        attr.location = (g.location.x - 400, g.location.y - 650)
+        nt.links.new(attr.outputs['Color'], g.inputs['Baked Light'])
+        g.inputs['Light Map Amount'].default_value = 0.0
+        return c
     nt.links.new(tex.outputs['Color'], g.inputs['Light Map'])
     g.inputs['Light Map Amount'].default_value = 1.0
     return c
+
+
+# ---------------------------------------------------------------- normal maps and shine with baked light
+
+SHADE_LAYER = 'PD_BakeShade'
+
+
+def keeps_detail(m):
+    """A PD material with a normal map or a highlight colour. The game's light-map shader (lbts) has no sun term:
+    it draws texture x (ambient + light map), so a normal map (bumps from the sun) and the sun's shine vanish on it.
+    Such materials keep their own shader (sbts / sbtsrefs: normal map and shine from the sun, as in game) and get
+    the bake as vertex shade instead: how much of the game's own sun + ambient light the bake leaves (shadows)."""
+    if m is None or pd_material.group_node(m) is None:
+        return False
+    try:
+        st = pd_material.read(m)
+    except Exception:
+        return False
+    return bool(st.get('normal')) or any(st.get('specular', (0, 0, 0, 0))[:3])
+
+
+def shade_sampler(img, scene):
+    """Function (u, v on the light map UVs, world normal) -> (r, g, b, 1) in the game's gamma space: the baked
+    light (light map, clipped to 1, + ambient) divided by what the game's sun and ambient give that face, 0-1, the
+    same in all three (normal-mapped surfaces use one channel as shade). None without the image's pixels."""
+    import numpy as np
+    w, h = img.size
+    if not w or not h:
+        return None
+    px = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    px = px.reshape(h, w, 4)
+    sun = pd_material._sun_dir(scene).normalized()
+    scol = np.array(tuple(getattr(scene, 'pd_stage_light', (0.706, 0.686, 0.608)))[:3], dtype=np.float32)
+    amb = np.array(game_ambient(scene), dtype=np.float32)
+
+    def shade(u, v, n):
+        x = min(max(u, 0.0), 1.0) * (w - 1)
+        y = min(max(v, 0.0), 1.0) * (h - 1)
+        x0, y0 = int(x), int(y)
+        x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
+        fx, fy = x - x0, y - y0
+        c = (px[y0, x0, :3] * (1 - fx) + px[y0, x1, :3] * fx) * (1 - fy) + \
+            (px[y1, x0, :3] * (1 - fx) + px[y1, x1, :3] * fx) * fy
+        ndl = max(0.0, n.normalized().dot(sun)) if n.length > 0 else 0.0
+        game = scol * ndl + amb
+        s = float(np.mean(np.clip((np.minimum(c, 1.0) + amb) / np.maximum(game, 1e-3), 0.0, 1.0)))
+        return (s, s, s, 1.0)
+    return shade
+
+
+def write_shade(ob, scene):
+    """The bake's shade per corner as the colour attribute PD_BakeShade (for the preview of keeps_detail
+    materials). The active colour attribute stays as it was. False when the mesh has no bake."""
+    light = baked_light(ob)
+    me = ob.data
+    uv = me.uv_layers.get(UV_NAME)
+    if light is None or uv is None:
+        return False
+    shade = shade_sampler(light, scene)
+    if shade is None:
+        return False
+    active = me.color_attributes.active_color_name
+    render = me.color_attributes.default_color_name
+    attr = me.color_attributes.get(SHADE_LAYER)
+    if attr is None or attr.domain != 'CORNER' or attr.data_type != 'FLOAT_COLOR':
+        if attr is not None:
+            me.color_attributes.remove(attr)
+        attr = me.color_attributes.new(SHADE_LAYER, 'FLOAT_COLOR', 'CORNER')
+    nmat = ob.matrix_world.to_3x3().inverted_safe().transposed()
+    normals = me.corner_normals
+    for li in range(len(me.loops)):
+        u, v = uv.data[li].uv
+        attr.data[li].color_srgb = shade(u, v, nmat @ normals[li].vector)
+    if active:
+        me.color_attributes.active_color_name = active
+    if render:
+        me.color_attributes.default_color_name = render
+    return True
 
 
 def show_baked(scene, on):

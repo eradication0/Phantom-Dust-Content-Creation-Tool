@@ -585,6 +585,21 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
         for i, m in enumerate(slots_mat):                # the bake's viewport preview: export the mesh's own
             if m is not None and m.name.startswith('PDBakeView_'):
                 slots_mat[i] = ob.data.materials[i] if i < len(ob.data.materials) else None
+        shade_cache = []
+
+        def bake_shade_read():
+            # (loop, vertex, polygon) -> the bake's shade (lightbake.shade_sampler), made once per mesh
+            if not shade_cache:
+                from . import lightbake
+                sample = lightbake.shade_sampler(lightbake.baked_light(ob), bpy.context.scene)
+                shade_cache.append(None if sample is None else (lambda li, vi, pi: sample(
+                    lm_uv.data[li].uv[0], lm_uv.data[li].uv[1], nmat @ cnormals[li].vector)))
+            return shade_cache[0]
+
+        def lightbake_keeps(m):
+            from . import lightbake
+            return lightbake.keeps_detail(m)
+
         legacy_col = me.color_attributes.get(LIGHT_LAYER) or me.color_attributes.active_color
         legacy_read = _corner_reader(me, ('attr', legacy_col.name, 'RGB')) if legacy_col is not None else None
         settings, readers = {}, {}
@@ -640,6 +655,12 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
                     st = dict(st, normal=st['normal'] or 'flat',
                               light=st['light'] if attr(st['light']) else ('const', (255, 255, 255)),
                               shine=st['shine'] if attr(st['shine']) else ('const', 1.0))
+                elif lm_ref is not None and not gmat['transparent'] and lightbake_keeps(mat):
+                    # a normal map or highlight: lbts would lose both (no sun term), so the material keeps its own
+                    # shader (sbts / sbtsrefs, normal map and shine from the sun) and the bake goes into the vertex
+                    # light as shade (lightbake.keeps_detail)
+                    gmat = dict(gmat, normal=gmat['normal'] or textures.flat_normal())
+                    st = dict(st, normal=st['normal'] or 'flat', light=('bakeshade',))
                 elif lm_ref is not None and not gmat['transparent']:   # light-mapped: lbts (no reflection map;
                     # lbts has no blended variant, so transparent materials keep vertex light)
                     gmat = dict(diffuse=gmat['diffuse'], lightmap=lm_ref,
@@ -649,7 +670,8 @@ def mesh_parts(depsgraph, ob, matrix, scale, textures, stats, parts=None):
                 settings[mi] = (st, gmat)
                 light = st['light']
                 light_read = legacy_read if light is None else (
-                    _corner_reader(me, light) if light[0] == 'attr' else None)
+                    _corner_reader(me, light) if light[0] == 'attr' else
+                    bake_shade_read() if light[0] == 'bakeshade' else None)
                 shine_read = _corner_reader(me, st['shine'], srgb=False) if st['shine'][0] == 'attr' else None
                 readers[mi] = (light_read, shine_read)
                 if st['normal'] is not None and tangents is None:

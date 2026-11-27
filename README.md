@@ -26,6 +26,14 @@ files (`stNN.dat` and `stNN.alr`) and can install them for you.
 
 Skill animations/projectiles are planned later.
 
+## What's new in 1.4.1
+
+- **Shininess** works the other way round: higher = a stronger, wider shine (stored as the game's specular power,
+  127 - Shininess). Materials from older files are converted when they open.
+- **Bake Lighting keeps normal maps and shine**: the game's light-map shader (lbts) has no sun term, so materials with
+  a normal map or a Specular Color now keep their own shader (sbts / sbtsrefs) and get the bake as vertex shade, in
+  game and in Show Baked Lighting. Other materials still use the light map.
+
 ## What's new in 1.4
 
 - **Round-trip rebuild**: a game map imported and exported again is built entirely from the Blender scene and comes

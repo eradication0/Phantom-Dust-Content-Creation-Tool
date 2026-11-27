@@ -8,7 +8,7 @@ map (see FORMATS.md, "Stage materials"):
   Normal Strength  the game has no strength setting: the exporter rescales the normal map's pixels instead
   Reflection Map   sphere map added on top (shader *refs), scaled by its alpha, the Shine Mask and the light
   Specular Color   colour of the sun's shine (black = none)
-  Shininess        specular power: which face angles shine (the game's shine is per vertex)
+  Shininess        how widely it shines (high = wider); the game's specular power is 127 - Shininess
   Shine Mask       where the shine / reflection show (stored as the vertex colour's alpha)
   Reflection Strength  stored in the reflection map's alpha
   Baked Light      vertex colour the game multiplies the lit texture by
@@ -28,7 +28,7 @@ from mathutils import Vector
 
 GROUP = 'PD Stage Shader'
 SPHERE_GROUP = 'PD Sphere Map'
-GROUP_VERSION = 13
+GROUP_VERSION = 14
 LIGHT_LAYER = 'PD_Light'
 SHINE_LAYER = 'PD_Shine'
 MAPS = ('Diffuse', 'Normal Map', 'Reflection Map', 'Emission Map')
@@ -61,10 +61,10 @@ SOCKETS = (
      'Colour and strength of the sun\'s shine. Black = none, like most of the game\'s own surfaces. The game '
      'uses dark to mid grey (about 0.1-0.5): full colours are very strong. In game the shine fills whole faces '
      'evenly (it is worked out per vertex), so curved or bevelled shapes show it best'),
-    ('Highlight', 'Shininess', 'NodeSocketFloat', 20.0, 0.0, 127.0,
-     'How exactly a face must face the sun\'s reflection to shine (the game\'s specular power): low = most '
-     'sunlit faces glow, high = only faces at the right angle. Not a spot size: a face shines evenly. '
-     'The game uses 2-80 (0 on surfaces without a highlight colour, and on one st08 sky layer)'),
+    ('Highlight', 'Shininess', 'NodeSocketFloat', 107.0, 0.0, 127.0,
+     'How widely the surface shines: high = most sunlit faces glow, low = only faces turned just right to the '
+     'sun\'s reflection. Not a spot size: a face shines evenly. Stored as the game\'s specular power, '
+     '127 - Shininess (the game uses powers 2-80, i.e. Shininess 47-125)'),
     ('Highlight', 'Shine Mask', 'NodeSocketFloat', 1.0, 0.0, 1.0,
      'Where the shine and reflection show: a value for the whole material, or link a Color Attribute '
      '(Paint Shine Mask) to paint it. Stored as the vertex colour\'s alpha'),
@@ -208,7 +208,8 @@ def _contents(ng):
                                  loc=(-550, 300)), 0.5, loc=(-450, 300)),
               bsdf.inputs['Specular IOR Level'])                 # Blender's default 0.5, more with a highlight
     links.new(gi.outputs['Specular Color'], bsdf.inputs['Specular Tint'])
-    rough = math_('POWER', math_('DIVIDE', 2.0, math_('ADD', gi.outputs['Shininess'], 2.0, loc=(-1000, 150)),
+    power = math_('SUBTRACT', 127.0, gi.outputs['Shininess'], loc=(-1150, 150), clamp=False)   # the game's power
+    rough = math_('POWER', math_('DIVIDE', 2.0, math_('ADD', power, 2.0, loc=(-1000, 150)),
                                  loc=(-850, 150)), 0.5, loc=(-700, 150))
     links.new(rough, bsdf.inputs['Roughness'])
     rsep = node('ShaderNodeSeparateColor', (-1200, 0))           # a coat only where there is a reflection map
@@ -233,7 +234,7 @@ def _contents(ng):
     # shine: (N.H)^power with H fixed per frame, times (1 - N.V), shine mask and specular colour
     half = vmath('NORMALIZE', vmath('ADD', sun_dir.outputs[0], view_dir.outputs[0], loc=(-1300, -2300)), loc=(-1150, -2300))
     ndh = math_('MAXIMUM', vmath('DOT_PRODUCT', n, half, loc=(-1000, -2300), out=1), 0.0, loc=(-850, -2300))
-    pw = math_('POWER', ndh, gi.outputs['Shininess'], loc=(-700, -2300))
+    pw = math_('POWER', ndh, power, loc=(-700, -2300))
     ndv = math_('MAXIMUM', vmath('DOT_PRODUCT', n, view_dir.outputs[0], loc=(-1000, -2450), out=1), 0.0, loc=(-850, -2450))
     view_term = math_('SUBTRACT', 1.0, ndv, loc=(-700, -2450), clamp=True)
     shine = math_('MULTIPLY', math_('MULTIPLY', pw, view_term, loc=(-550, -2350)), gi.outputs['Shine Mask'], loc=(-400, -2350))
@@ -362,6 +363,10 @@ def _repair_new_inputs(ng, old, added=()):
                 inp = n.inputs.get(name)
                 if inp is not None and not inp.is_linked:
                     inp.default_value = default
+            if 0 < old < 14:                             # Shininess was the game's power: now 127 - power
+                inp = n.inputs.get('Shininess')
+                if inp is not None and not inp.is_linked:
+                    inp.default_value = 127.0 - inp.default_value
             if old < 11:                                 # left black by version 10
                 for name in ('Diffuse Color', 'Emission Color'):
                     inp = n.inputs.get(name)
@@ -613,7 +618,7 @@ def setup(mat, diffuse=None, normal=None, reflection=None, specular=(0.0, 0.0, 0
     g.width = 240
     nt.links.new(g.outputs['Shader'], out.inputs['Surface'])
     g.inputs['Specular Color'].default_value = (*specular, 1.0)
-    g.inputs['Shininess'].default_value = shininess
+    g.inputs['Shininess'].default_value = 127.0 - shininess     # shininess: the game's power
     g.inputs['Shine Mask'].default_value = shine
     g.inputs['Reflection Strength'].default_value = reflection_strength
     g.inputs['Normal Strength'].default_value = normal_strength
@@ -832,7 +837,7 @@ def read(mat):
                     **transparency(mat), **scrolling(mat))
     ins = g.inputs
     sc = ins['Specular Color'].default_value
-    spec = tuple(_byte(_srgb(sc[k])) for k in range(3)) + (int(round(ins['Shininess'].default_value)),)
+    spec = tuple(_byte(_srgb(sc[k])) for k in range(3)) + (int(round(127.0 - ins['Shininess'].default_value)),)
     shine = _attribute_source(ins['Shine Mask']) or ('const', ins['Shine Mask'].default_value)
     light = _attribute_source(ins['Baked Light'])
     if light is None and not ins['Baked Light'].is_linked:
